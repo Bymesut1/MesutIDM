@@ -144,7 +144,7 @@ object Dm {
             val end = if (i == PARTS - 1) size - 1 else start + chunk - 1
             Thread {
                 try {
-                    range(d, tmp, longArrayOf(start), end)
+                    range(d, tmp, AtomicLong(start), end)
                 } catch (e: Exception) {
                     failure.set(e)
                     d.cancelled = true
@@ -155,28 +155,28 @@ object Dm {
         failure.get()?.let { d.cancelled = false; throw it }
     }
 
-    private fun range(d: Item, tmp: File, pos: LongArray, end: Long) {
+    private fun range(d: Item, tmp: File, pos: AtomicLong, end: Long) {
         var tries = 0
-        while (pos[0] <= end && !d.cancelled) {
+        while (pos.get() <= end && !d.cancelled) {
             try {
-                val c = open(d, d.url, "bytes=${pos[0]}-$end")
+                val c = open(d, d.url, "bytes=${pos.get()}-$end")
                 if (c.responseCode != 206) throw Exception("HTTP ${c.responseCode}")
                 val ins = c.inputStream
                 val raf = RandomAccessFile(tmp, "rw")
                 try {
-                    raf.seek(pos[0])
+                    raf.seek(pos.get())
                     val buf = ByteArray(65536)
                     while (!d.cancelled) {
                         val n = ins.read(buf)
                         if (n < 0) break
                         raf.write(buf, 0, n)
-                        pos[0] += n
+                        pos.addAndGet(n.toLong())
                         d.done.addAndGet(n.toLong())
                     }
                 } finally {
                     raf.close(); ins.close()
                 }
-                if (pos[0] <= end && !d.cancelled) throw Exception("kısa veri")
+                if (pos.get() <= end && !d.cancelled) throw Exception("kısa veri")
             } catch (e: Exception) {
                 if (d.cancelled) return
                 if (++tries > 6) throw e
