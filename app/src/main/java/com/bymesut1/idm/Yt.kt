@@ -97,7 +97,31 @@ object Yt {
             }
         }
         if (list.isEmpty()) return null
-        return YtResult(title, build(title, list, VR_UA), "android_vr")
+        val entries = ArrayList<Found>(build(title, list, VR_UA))
+        entries.addAll(captionsOf(j, title, VR_UA))
+        return YtResult(title, entries, "android_vr")
+    }
+
+    private fun captionsOf(j: JSONObject, title: String, ua: String?): List<Found> {
+        val out = ArrayList<Found>()
+        val arr = j.optJSONObject("captions")?.optJSONObject("playerCaptionsTracklistRenderer")
+            ?.optJSONArray("captionTracks") ?: return out
+        val base = U.safe(title).take(70)
+        for (i in 0 until arr.length()) {
+            val o = arr.getJSONObject(i)
+            val bu = o.optString("baseUrl")
+            if (bu.isEmpty()) continue
+            val nm = o.optJSONObject("name")
+            var label = nm?.optString("simpleText") ?: ""
+            if (label.isEmpty()) label = nm?.optJSONArray("runs")?.optJSONObject(0)?.optString("text") ?: ""
+            if (label.isEmpty()) label = o.optString("languageCode", "?")
+            val url = bu.replace(Regex("&fmt=[^&]*"), "") + "&fmt=srt"
+            out.add(
+                Found(url, "$base [${U.safe(label)}].srt", "", Found.FILE, null,
+                    "Altyazı ($label) • SRT • YouTube", -1L, ua, 1)
+            )
+        }
+        return out
     }
 
     private fun fmtOf(o: JSONObject): YFmt? {
@@ -134,7 +158,22 @@ object Yt {
                     }
                 }
                 if (list.isEmpty()) continue
-                return YtResult(title, build(title, list, null), "invidious")
+                val entries = ArrayList<Found>(build(title, list, null))
+                val caps = j.optJSONArray("captions")
+                if (caps != null) {
+                    for (i in 0 until caps.length()) {
+                        val o = caps.getJSONObject(i)
+                        var cu = o.optString("url")
+                        if (cu.isEmpty()) continue
+                        if (cu.startsWith("/")) cu = inst + cu
+                        val lb = o.optString("label", o.optString("language_code", "?"))
+                        entries.add(
+                            Found(cu, "${U.safe(title).take(70)} [${U.safe(lb)}].vtt", "", Found.FILE, null,
+                                "Altyazı ($lb) • VTT • YouTube", -1L, null, 1)
+                        )
+                    }
+                }
+                return YtResult(title, entries, "invidious")
             } catch (e: Exception) {
             }
         }
