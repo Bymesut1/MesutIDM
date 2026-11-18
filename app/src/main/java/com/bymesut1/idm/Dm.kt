@@ -38,6 +38,7 @@ class Found(
 ) {
     var mime: String = ""
     @Volatile var data: String? = null
+    @Volatile var dataBytes: ByteArray? = null
 
     companion object {
         const val FILE = 0
@@ -202,10 +203,11 @@ object Dm {
     // ---------------------------------------------------------------- Normal dosya
     private fun doFile(d: Item, j: Job) {
         val inl = d.f.data
-        if (inl != null) {
-            // Sayfadan yakalanan altyazı metni: yeniden indirmeden doğrudan kaydet
+        val inb = d.f.dataBytes
+        if (inl != null || inb != null) {
+            // Sayfadan / önceden yakalanan altyazı: yeniden indirmeden doğrudan kaydet (bayt varsa özgün kodlama korunur)
             val tf = j.tmp("f")
-            tf.writeText(inl, Charsets.UTF_8)
+            if (inb != null) tf.writeBytes(inb) else tf.writeText(inl ?: "", Charsets.UTF_8)
             d.segments = false
             d.total = tf.length()
             d.done.set(tf.length())
