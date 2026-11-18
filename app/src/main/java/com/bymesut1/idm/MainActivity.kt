@@ -110,6 +110,9 @@ class MainActivity : Activity() {
     private val subExt = setOf("srt", "vtt", "ass", "ssa", "ttml", "dfxp", "sbv")
     private val subSegRe = Regex("(seg|segment|chunk|frag|fragment)[-_]?\\d+|/\\d+\\.(web)?vtt$", RegexOption.IGNORE_CASE)
 
+    private val subHintRe = Regex("(subtitle|caption|altyaz|/subs?/|[?&](lang|language|srclang)=|[/_.-](vtt|srt)([/_.?&-]|$))")
+    private val staticRe = Regex("\\.(js|css|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|otf|html?|map)$")
+
     private fun dp(i: Int) = (i * resources.displayMetrics.density).toInt()
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
 
@@ -123,6 +126,11 @@ class MainActivity : Activity() {
         @JavascriptInterface
         fun sub(url: String, page: String, label: String) {
             runOnUiThread { addSub(tab, url, page, label, null) }
+        }
+
+        @JavascriptInterface
+        fun subData(url: String, page: String, label: String, ext: String, text: String) {
+            runOnUiThread { addSub(tab, url, page, label, ext, text) }
         }
 
         @JavascriptInterface
@@ -458,8 +466,12 @@ class MainActivity : Activity() {
             runOnUiThread { addYtCaption(t, u, ref) }
             return
         }
+        val dest = r.requestHeaders?.get("Sec-Fetch-Dest") ?: ""
+        val low = u.lowercase()
         if (mediaRe.containsMatchIn(u)) runOnUiThread { addFound(t, u, ref, "") }
-        else if (hasRange) runOnUiThread { probeAmbiguous(t, u, ref) }
+        else if (dest == "track" || (subHintRe.containsMatchIn(low) && !staticRe.containsMatchIn(low.substringBefore('?')))) {
+            runOnUiThread { probeSubContent(t, u, ref) }
+        } else if (hasRange) runOnUiThread { probeAmbiguous(t, u, ref) }
     }
 
     private fun externalScheme(u: String): Boolean {
@@ -645,10 +657,18 @@ class MainActivity : Activity() {
     }
 
     // Altyazı dosyası (.srt/.vtt/...) ekle
-    private fun addSub(t: Tab, u0: String, page: String, label: String, forceExt: String?) {
+    private fun addSub(t: Tab, u0: String, page: String, label: String, forceExt: String?, data: String? = null) {
         val u = u0.substringBefore('#')
-        if (!(u.startsWith("http://") || u.startsWith("https://"))) return
-        if (t.found.containsKey(u)) return
+        if (!(u.startsWith("http://") || u.startsWith("https://")) && data == null) return
+        val old = t.found[u]
+        if (old != null) {
+            // Aynı altyazı sonradan metniyle gelirse metni ekle (daha güvenilir indirme)
+            if (data != null && old.data == null) {
+                old.data = data
+                old.size = data.length.toLong()
+            }
+            return
+        }
         val path = u.substringBefore('?')
         if (subSegRe.containsMatchIn(path)) return
         val file = path.substringAfterLast('/')
@@ -663,7 +683,49 @@ class MainActivity : Activity() {
         )
         t.found[u] = f
         refreshBtn()
-        probeFound(t, f)
+        if (data != null) {
+            f.data = data
+            f.size = data.length.toLong()
+        } else {
+            probeFound(t, f)
+        }
+    }
+
+    // Uzantısız / ipucu veren adresler: ilk baytlara bakıp altyazı mı diye anla
+    private fun probeSubContent(t: Tab, u: String, ref: String) {
+        if (!(u.startsWith("http://") || u.startsWith("https://"))) return
+        if (t.found.containsKey(u)) return
+        if (!t.seen.add("S" + u)) return
+        if (t.seen.size > 1500) t.seen.clear()
+        val ua = t.web.settings.userAgentString
+        val ck = CookieManager.getInstance().getCookie(u) ?: ""
+        probePool.execute {
+            try {
+                val k = Net.open(u, ua, ref, ck, "bytes=0-2999")
+                try {
+                    val code = k.code
+                    if (code == 200 || code == 206) {
+                        val ct = (k.c.contentType ?: "").lowercase()
+                        if (!ct.startsWith("image/") && !ct.startsWith("video/") && !ct.startsWith("audio/")) {
+                            val buf = ByteArray(3000)
+                            var n = 0
+                            k.c.inputStream.use { ins ->
+                                while (n < 3000) {
+                                    val r = ins.read(buf, n, 3000 - n)
+                                    if (r < 0) break
+                                    n += r
+                                }
+                            }
+                            val kind = U.sniffSub(String(buf, 0, n, Charsets.UTF_8))
+                            if (kind != null) runOnUiThread { addSub(t, u, ref, "", kind) }
+                        }
+                    }
+                } finally {
+                    k.c.disconnect()
+                }
+            } catch (e: Exception) {
+            }
+        }
     }
 
     // YouTube oynatıcısı altyazı isteyince (CC açılınca) SRT olarak ekle
