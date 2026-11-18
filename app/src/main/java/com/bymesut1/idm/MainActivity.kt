@@ -47,6 +47,7 @@ import android.widget.ListView
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
+import androidx.webkit.ScriptHandler
 import androidx.webkit.UserAgentMetadata
 import androidx.webkit.WebSettingsCompat
 import androidx.webkit.WebViewCompat
@@ -64,6 +65,12 @@ class MainActivity : Activity() {
         val seen = HashSet<String>()
         var ytLast = ""
         var lastPage = ""
+        val hidden = HashSet<String>()
+        val role = HashMap<String, String>()        // HLS playlist rolü: master / video / audio / muxed
+        val audioFor = HashMap<String, String>()    // video playlist -> ayrı ses playlist'i (otomatik birleştirme)
+        var siteLast = ""
+        var tsProbes = 0
+        var hook: ScriptHandler? = null
         var desktop = false
     }
 
@@ -103,7 +110,7 @@ class MainActivity : Activity() {
     private var chFull = "130.0.0.0"
 
     private val mediaRe = Regex(
-        "\\.(mp4|m3u8|mpd|mkv|webm|mp3|m4a|flv|avi|mov|aac|ogg|opus|wav|zip|rar|7z|apk|pdf|iso|srt|vtt|ass|ssa|ttml|dfxp|sbv)(\\?|&|#|$)",
+        "\\.(mp4|m4v|mkv|webm|mov|avi|wmv|flv|f4v|3gp|3g2|mpg|mpeg|mpv|ogv|vob|m2ts|mts|asf|rm|rmvb|divx|m3u8|mpd|mp3|m4a|aac|ogg|oga|opus|wav|flac|wma|amr|mka|ac3|zip|rar|7z|tar|gz|tgz|bz2|xz|apk|pdf|iso|exe|msi|dmg|docx|xlsx|pptx|epub|srt|vtt|ass|ssa|ttml|dfxp|sbv)(\\?|&|#|$)",
         RegexOption.IGNORE_CASE
     )
     private val segRe = Regex("\\.(ts|m4s|m4f|cmfv|cmfa|vtt|webvtt|srt)$", RegexOption.IGNORE_CASE)
@@ -114,6 +121,7 @@ class MainActivity : Activity() {
     private val subHintRe = Regex("(subtitle|caption|altyaz|/subs?/|[?&](lang|language|srclang)=|[/_.-](vtt|srt)([/_.?&-]|$))")
     private val staticRe = Regex("\\.(js|css|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|otf|html?|map)$")
 
+    private val tsSegRe = Regex("\\d+\\.ts$|(seg|segment|chunk|frag|fragment)[-_]?\\d*")
     private val netLog = ArrayDeque<String>()
     private val logSkipRe = Regex("\\.(ts|m4s|js|css|png|jpe?g|gif|webp|avif|svg|ico|woff2?|ttf|otf|map)$")
 
@@ -204,6 +212,7 @@ class MainActivity : Activity() {
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         Dm.setup(this)
+        Dm.connections = getSharedPreferences("idm", MODE_PRIVATE).getInt("conns", 8)
         hist = HistoryDb(applicationContext)
         if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
         initIdentity()
@@ -449,7 +458,7 @@ class MainActivity : Activity() {
         cm.setAcceptThirdPartyCookies(w, true)
         w.addJavascriptInterface(Bridge(t), "IDM")
         if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
-            WebViewCompat.addDocumentStartJavaScript(w, Hook.JS, setOf("*"))
+            t.hook = WebViewCompat.addDocumentStartJavaScript(w, Hook.JS, setOf("*"))
         }
         w.webViewClient = client(t)
         w.webChromeClient = chrome(t)
@@ -473,6 +482,11 @@ class MainActivity : Activity() {
         }
         val dest = r.requestHeaders?.get("Sec-Fetch-Dest") ?: ""
         val low = u.lowercase()
+        val pth = low.substringBefore('?')
+        if (pth.endsWith(".ts")) {
+            if (!tsSegRe.containsMatchIn(pth)) runOnUiThread { probeBigTs(t, u, ref) }
+            return
+        }
         if (mediaRe.containsMatchIn(u)) runOnUiThread { addFound(t, u, ref, "") }
         else if (dest == "track" || (subHintRe.containsMatchIn(low) && !staticRe.containsMatchIn(low.substringBefore('?')))) {
             runOnUiThread { probeSubContent(t, u, ref) }
@@ -508,16 +522,6 @@ class MainActivity : Activity() {
         }
 
         override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-            if (url != null && url != t.lastPage) {
-                // Yeni sayfa: eski sayfanın bulunanlarını temizle (listeyi karıştırma)
-                t.lastPage = url
-                val keep = t.found[url]
-                t.found.clear()
-                t.seen.clear()
-                t.ytLast = ""
-                if (keep != null) t.found[url] = keep
-                if (t === cur) refreshBtn()
-            }
             if (t === cur && url != null) urlBar.setText(url)
         }
 
@@ -533,6 +537,7 @@ class MainActivity : Activity() {
                 io.execute { hist.add(url, title) }
             }
             checkYoutube(t, url)
+            checkSite(t, url)
         }
     }
 
@@ -633,7 +638,13 @@ class MainActivity : Activity() {
 
     // ------------------------------------------------------------------ Medya yakalama (IDM mantığı)
     private fun refreshBtn() {
-        foundBtn.text = "⬇ Bulunan (${cur?.found?.size ?: 0})"
+        val c = cur
+        foundBtn.text = "⬇ Bulunan (${if (c == null) 0 else visibleFound(c).size})"
+    }
+
+    // Listede gösterilecekler: bir master playlist'in içinde adı geçen alt playlistleri (kalite/ses) gizle
+    private fun visibleFound(t: Tab): List<Found> {
+        return t.found.values.toList()
     }
 
     private fun addFound(t: Tab, u0: String, page: String, kindHint: String) {
@@ -648,7 +659,7 @@ class MainActivity : Activity() {
         if (segRe.containsMatchIn(path)) return
         val host = U.host(u)
         if (host.endsWith("googlevideo.com")) return
-        if (t.found.size >= 250) t.found.remove(t.found.keys.first())
+        if (t.found.size >= 800) t.found.remove(t.found.keys.first())
         val low = path.lowercase()
         val kind = when {
             kindHint == "hls" || low.endsWith(".m3u8") -> Found.HLS
@@ -667,8 +678,37 @@ class MainActivity : Activity() {
         val f = Found(u, U.safe(title).take(80) + "." + ext, page.ifBlank { t.web.url ?: "" }, kind)
         t.found[u] = f
         refreshBtn()
-        probeFound(t, f)
-        if (kind == Found.HLS || kind == Found.DASH) probeSubs(t, f)
+        if (kind == Found.HLS || kind == Found.DASH) probeSubs(t, f) else probeFound(t, f)
+    }
+
+    // Büyük tek parça .ts dosyası mı (film) yoksa HLS parçası mı: boyuta bak
+    private fun probeBigTs(t: Tab, u: String, ref: String) {
+        if (!touchOk(u) || t.found.containsKey(u) || t.tsProbes >= 25) return
+        t.tsProbes++
+        val ua = t.web.settings.userAgentString
+        val ck = CookieManager.getInstance().getCookie(u) ?: ""
+        probePool.execute {
+            try {
+                val k = Net.open(u, ua, ref, ck, "bytes=0-0")
+                try {
+                    var total = -1L
+                    if (k.code == 206) total = k.c.getHeaderField("Content-Range")?.substringAfter('/')?.trim()?.toLongOrNull() ?: -1L
+                    else if (k.code == 200) total = k.c.contentLengthLong
+                    if (total > 12_000_000L) {
+                        runOnUiThread {
+                            val title = (t.web.title ?: "").trim().ifBlank { U.host(u).ifBlank { "video" } }
+                            val f = Found(u, U.safe(title).take(80) + ".ts", ref.ifBlank { t.web.url ?: "" }, Found.FILE)
+                            f.size = total
+                            t.found[u] = f
+                            refreshBtn()
+                        }
+                    }
+                } finally {
+                    k.c.disconnect()
+                }
+            } catch (e: Exception) {
+            }
+        }
     }
 
     // Altyazı dosyası (.srt/.vtt/...) ekle
@@ -709,7 +749,7 @@ class MainActivity : Activity() {
     // Uzantısız / ipucu veren adresler: ilk baytlara bakıp altyazı mı diye anla
     private fun probeSubContent(t: Tab, u: String, ref: String) {
         if (!(u.startsWith("http://") || u.startsWith("https://"))) return
-        if (t.found.containsKey(u)) return
+        if (t.found.containsKey(u) || !touchOk(u)) return
         if (!t.seen.add("S" + u)) return
         if (t.seen.size > 1500) t.seen.clear()
         val ua = t.web.settings.userAgentString
@@ -751,16 +791,59 @@ class MainActivity : Activity() {
     }
 
     // HLS master / DASH içindeki altyazı kanallarını bul
+    // Bu sitelerde oynatıcının kendi isteklerine karışmayalım (tek kullanımlık / oturumlu adresler)
+    private fun touchOk(u: String): Boolean {
+        val h = U.host(u).lowercase()
+        return !(h.endsWith("dailymotion.com") || h.endsWith("dmcdn.net") || h.endsWith("googlevideo.com") || h.endsWith("youtube.com"))
+    }
+
+    // HLS master / DASH içini incele: altyazı kanalları + hangi video listesinin ayrı sesi var (otomatik birleştirme)
     private fun probeSubs(t: Tab, f: Found) {
-        val ua = t.web.settings.userAgentString
-        val ck = CookieManager.getInstance().getCookie(f.url) ?: ""
+        if (!touchOk(f.url)) return
         val titleBase = U.baseName(f.name)
-        probePool.execute {
-            try {
-                val txt = Net.text(f.url, ua, f.referer, ck)
-                val list = if (f.kind == Found.HLS) Hls.subs(f.url, txt) else Dash.subtitles(f.url, txt)
-                if (list.isNotEmpty()) {
+        h.postDelayed({
+            val ua = t.web.settings.userAgentString
+            val ck = CookieManager.getInstance().getCookie(f.url) ?: ""
+            probePool.execute {
+                try {
+                    val txt = Net.text(f.url, ua, f.referer, ck)
+                    val list = if (f.kind == Found.HLS) Hls.subs(f.url, txt) else Dash.subtitles(f.url, txt)
+                    val roles = HashMap<String, String>()
+                    val audios = HashMap<String, String>()
+                    if (f.kind == Found.HLS && txt.contains("#EXT-X-STREAM-INF")) {
+                        roles[f.url] = "master"
+                        val ls = txt.lines().map { it.trim() }
+                        val groups = HashMap<String, String>()
+                        val audioUris = HashSet<String>()
+                        for (ln in ls) {
+                            if (!ln.startsWith("#EXT-X-MEDIA:")) continue
+                            val a = Hls.attrs(ln)
+                            if (a["TYPE"] != "AUDIO") continue
+                            val ru = a["URI"] ?: continue
+                            val au = Hls.resolve(f.url, ru).substringBefore('#')
+                            audioUris.add(au)
+                            val g = a["GROUP-ID"]
+                            if (g != null && (!groups.containsKey(g) || a["DEFAULT"] == "YES")) groups[g] = au
+                        }
+                        for (au in audioUris) roles[au] = "audio"
+                        for (i in ls.indices) {
+                            if (!ls[i].startsWith("#EXT-X-STREAM-INF")) continue
+                            val a = Hls.attrs(ls[i])
+                            val ru = ls.drop(i + 1).firstOrNull { it.isNotEmpty() && !it.startsWith("#") } ?: continue
+                            val vu = Hls.resolve(f.url, ru).substringBefore('#')
+                            val g = a["AUDIO"]
+                            val au = if (g != null) groups[g] else null
+                            if (au != null && au != vu) {
+                                audios[vu] = au
+                                roles[vu] = "video"
+                            } else {
+                                roles[vu] = "muxed"
+                            }
+                        }
+                    }
                     runOnUiThread {
+                        t.role.putAll(roles)
+                        t.audioFor.putAll(audios)
                         for (x in list) {
                             if (t.found.containsKey(x.second)) continue
                             if (f.kind == Found.HLS) {
@@ -779,10 +862,10 @@ class MainActivity : Activity() {
                         }
                         refreshBtn()
                     }
+                } catch (e: Exception) {
                 }
-            } catch (e: Exception) {
             }
-        }
+        }, 4000L)
     }
 
     private fun probeFound(t: Tab, f: Found) {
@@ -790,6 +873,7 @@ class MainActivity : Activity() {
             fetchSubData(t, f)
             return
         }
+        if (!touchOk(f.url)) return
         val ua = t.web.settings.userAgentString
         val ck = CookieManager.getInstance().getCookie(f.url) ?: ""
         probePool.execute {
@@ -832,7 +916,7 @@ class MainActivity : Activity() {
     // Uzantısız ama Range ile istenen (oynatıcı) istekleri: içerik türüne bakıp karar ver.
     private fun probeAmbiguous(t: Tab, u: String, ref: String) {
         if (!(u.startsWith("http://") || u.startsWith("https://"))) return
-        if (U.host(u).endsWith("googlevideo.com")) return
+        if (!touchOk(u)) return
         if (!t.seen.add(u)) return
         if (t.seen.size > 1500) t.seen.clear()
         val ua = t.web.settings.userAgentString
@@ -966,19 +1050,61 @@ class MainActivity : Activity() {
         }.start()
     }
 
+    // Dailymotion / OK.ru / VK / Mail.ru: siteye özel çözücü
+    private fun checkSite(t: Tab, url: String?) {
+        if (url == null) return
+        val k = Sites.key(url) ?: return
+        if (k == t.siteLast) return
+        t.siteLast = k
+        Thread {
+            val r = try {
+                Sites.resolve(url)
+            } catch (e: Exception) {
+                null
+            }
+            runOnUiThread {
+                if (r != null && r.entries.isNotEmpty()) {
+                    for (f in r.entries) t.found[f.url + (f.audioUrl ?: "")] = f
+                    refreshBtn()
+                    toast("${r.source}: ${r.entries.size} seçenek bulundu")
+                }
+            }
+        }.start()
+    }
+
+    private fun chooseConns() {
+        val opts = intArrayOf(1, 2, 4, 8, 16, 32)
+        AlertDialog.Builder(this)
+            .setTitle("Eşzamanlı bağlantı (şu an ${Dm.connections})")
+            .setItems(opts.map { "$it bağlantı" }.toTypedArray()) { _, i ->
+                Dm.connections = opts[i]
+                getSharedPreferences("idm", MODE_PRIVATE).edit().putInt("conns", opts[i]).apply()
+                toast("Yeni indirmelerde ${opts[i]} bağlantı kullanılacak")
+            }
+            .show()
+    }
+
+    private fun toggleHook(t: Tab) {
+        if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            toast("Bu cihazda desteklenmiyor")
+            return
+        }
+        val cur0 = t.hook
+        if (cur0 != null) {
+            cur0.remove()
+            t.hook = null
+            toast("Sayfa izleyici KAPALI (sayfa yenileniyor)")
+        } else {
+            t.hook = WebViewCompat.addDocumentStartJavaScript(t.web, Hook.JS, setOf("*"))
+            toast("Sayfa izleyici AÇIK (sayfa yenileniyor)")
+        }
+        t.web.reload()
+    }
+
     // ------------------------------------------------------------------ Bulunanlar listesi
     private fun showFound() {
         val t = cur ?: return
-        val all0 = t.found.values.toList()
-        // Master playlist varsa aynı klasördeki alt (varyant) playlistleri gizle
-        val masterDirs = all0.filter {
-            it.kind == Found.HLS && it.url.substringBefore('?').substringAfterLast('/').lowercase().startsWith("master")
-        }.map { it.url.substringBefore('?').substringBeforeLast('/') }.toSet()
-        val all = all0.filter { f ->
-            !(f.kind == Found.HLS &&
-                !f.url.substringBefore('?').substringAfterLast('/').lowercase().startsWith("master") &&
-                masterDirs.contains(f.url.substringBefore('?').substringBeforeLast('/')))
-        }
+        val all = visibleFound(t)
         val list = all.filter { it.pri > 0 } + all.filter { it.pri == 0 }.reversed()
         if (list.isEmpty()) {
             Toast.makeText(this, "Henüz medya/dosya bulunamadı. Videoyu oynat veya sayfayı gez.", Toast.LENGTH_LONG).show()
@@ -991,7 +1117,13 @@ class MainActivity : Activity() {
                 v.findViewById<TextView>(android.R.id.text1).text = f.name
                 val desc = if (f.label.isNotEmpty()) f.label else {
                     val k = when (f.kind) {
-                        Found.HLS -> "HLS akış (parçalı)"
+                        Found.HLS -> when (t.role[f.url]) {
+                            "master" -> "HLS master (en iyi kalite + ses otomatik birleşir)"
+                            "video" -> "HLS video (ayrı ses otomatik birleşir)"
+                            "audio" -> "HLS sadece ses"
+                            "muxed" -> "HLS video+ses"
+                            else -> "HLS akış (parçalı)"
+                        }
                         Found.DASH -> "DASH akış"
                         else -> U.extOf(f.name).uppercase()
                     }
@@ -1075,8 +1207,15 @@ class MainActivity : Activity() {
             .show()
     }
 
-    private fun startDl(f: Found) {
+    private fun startDl(f0: Found) {
         val t = cur ?: return
+        var f = f0
+        val au = t.audioFor[f0.url]
+        if (f0.kind == Found.HLS && au != null && f0.audioUrl == null) {
+            f = Found(f0.url, f0.name, f0.referer, Found.HLS, au, f0.label, f0.size, f0.ua, f0.pri)
+            f.noCookies = f0.noCookies
+            f.cookie = f0.cookie
+        }
         val ua = t.web.settings.userAgentString
         val ck = CookieManager.getInstance().getCookie(f.url) ?: ""
         Dm.start(this, f, ua, ck)
@@ -1088,7 +1227,7 @@ class MainActivity : Activity() {
             if (d.segments) "${d.done.get()} / ${d.total} parça"
             else {
                 val pct = if (d.total > 0) minOf(100L, d.done.get() * 100 / d.total).toInt() else 0
-                "%$pct  ${U.fmt(d.done.get())} / ${if (d.total > 0) U.fmt(d.total) else "?"}  ${U.fmt(d.speed)}/s"
+                "%$pct  ${U.fmt(d.done.get())} / ${if (d.total > 0) U.fmt(d.total) else "?"}  ${U.fmt(d.speed)}/s" + (if (d.conns > 0) "  •  ${d.conns} bağlantı" else "")
             }
         "Birleştiriliyor" -> {
             val pct = if (d.total > 0) minOf(100L, d.done.get() * 100 / d.total).toInt() else 0
@@ -1150,6 +1289,13 @@ class MainActivity : Activity() {
                     else -> 0
                 }
                 row.addView(pb)
+                val pparts = d.parts
+                if (pparts != null && !d.segments) {
+                    val bar = PartsBar(this@MainActivity)
+                    bar.parts = pparts
+                    bar.allDone = d.state == "Bitti"
+                    row.addView(bar, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT))
+                }
                 row.addView(TextView(this@MainActivity).apply { text = status(d); textSize = 12f })
                 return row
             }
@@ -1318,7 +1464,9 @@ class MainActivity : Activity() {
             "Sayfada medya tara / yenile",
             "Sayfayı yenile",
             "Sayfa linkini kopyala",
-            "Ağ isteklerini göster (tanılama)"
+            "Ağ isteklerini göster (tanılama)",
+            "İndirme bağlantı sayısı: ${Dm.connections}",
+            "Sayfa izleyici (JS): " + (if (t.hook != null) "AÇIK" else "kapalı")
         )
         AlertDialog.Builder(this)
             .setItems(items) { _, i ->
@@ -1333,12 +1481,16 @@ class MainActivity : Activity() {
                     3 -> {
                         t.web.evaluateJavascript("window.__idmScan&&window.__idmScan()", null)
                         t.ytLast = ""
+                        t.siteLast = ""
                         checkYoutube(t, t.web.url)
+                        checkSite(t, t.web.url)
                         toast("Taranıyor…")
                     }
                     4 -> t.web.reload()
                     5 -> copy(t.web.url ?: "")
-                    else -> showNetLog()
+                    6 -> showNetLog()
+                    7 -> chooseConns()
+                    else -> toggleHook(t)
                 }
             }
             .show()
