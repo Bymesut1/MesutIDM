@@ -32,6 +32,18 @@ object U {
         return if (i > 0 && n.length - i <= 6) n.substring(i + 1).lowercase() else ""
     }
 
+    /** Metnin başına bakıp altyazı mı diye anlar: vtt / srt / ass / ttml, değilse null. */
+    fun sniffSub(t: String): String? {
+        val s = t.trimStart('\uFEFF', ' ', '\n', '\r', '\t')
+        if (s.startsWith("WEBVTT")) return "vtt"
+        if (Regex("^\\d+\\s*\\r?\\n\\d{1,2}:\\d\\d:\\d\\d[,.]\\d{1,3}\\s*-->").containsMatchIn(s)) return "srt"
+        if (s.startsWith("[Script Info]", true)) return "ass"
+        if ((s.startsWith("<?xml") || s.startsWith("<tt")) && s.contains("<tt") &&
+            (s.contains("ttml", true) || s.contains("xml:lang"))
+        ) return "ttml"
+        return null
+    }
+
     fun mimeForExt(ext: String): String = when (ext) {
         "ts" -> "video/mp2t"
         "mkv" -> "video/x-matroska"
