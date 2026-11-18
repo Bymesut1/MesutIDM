@@ -7,6 +7,23 @@ object Hook {
   if (window.__idmHooked) return;
   window.__idmHooked = true;
   var seen = {};
+  var __q = [];
+  function __call(n, a){
+    if (n === 'found') IDM.found(a[0], a[1], a[2]);
+    else if (n === 'sub') IDM.sub(a[0], a[1], a[2]);
+    else if (n === 'subData') IDM.subData(a[0], a[1], a[2], a[3], a[4]);
+  }
+  // IDM köprüsü henüz hazır değilse kayıt kaybolmasın: kuyruğa al, hazır olunca gönder
+  function send(n, a){
+    try { if (typeof IDM !== 'undefined') { __call(n, a); return; } } catch (e) {}
+    __q.push([n, a]);
+    if (__q.length > 300) __q.shift();
+  }
+  setInterval(function(){
+    if (!__q.length || typeof IDM === 'undefined') return;
+    var q = __q; __q = [];
+    for (var i = 0; i < q.length; i++) { try { __call(q[i][0], q[i][1]); } catch (e) {} }
+  }, 600);
   var MEDIA = /\.(mp4|m3u8|mpd|mkv|webm|mp3|m4a|flv|avi|mov|aac|ogg|opus|wav|zip|rar|7z|apk|pdf|iso|srt|vtt|ass|ssa|ttml|dfxp|sbv)(\?|#|&|$)/i;
 
   function kindOf(u){
@@ -23,7 +40,7 @@ object Hook {
       try { u = new URL(u, location.href).href; } catch (e) { return; }
       if (!/^https?:/i.test(u) || seen[u]) return;
       seen[u] = 1;
-      if (typeof IDM !== 'undefined') IDM.found(u, location.href, kind || kindOf(u));
+      send('found', [u, location.href, kind || kindOf(u)]);
     } catch (e) {}
   }
   // Metin / JSON içinde gömülü medya adreslerini bul (API cevapları, player ayarları)
@@ -67,7 +84,7 @@ object Hook {
       try { u = new URL(u, location.href).href; } catch (e) { return; }
       if (!/^https?:/i.test(u) || seen[u]) return;
       seen[u] = 1;
-      if (typeof IDM !== 'undefined') IDM.sub(u, location.href, label || '');
+      send('sub', [u, location.href, label || '']);
     } catch (e) {}
   }
   function repSubData(u, t, label){
@@ -80,7 +97,7 @@ object Hook {
       seen[key] = 1;
       var h = String(t).substring(0, 600).replace(/^\uFEFF/, '').trim();
       var ext = /^WEBVTT/.test(h) ? 'vtt' : (/^\[Script Info\]/i.test(h) ? 'ass' : (/<tt[\s>]/.test(h) ? 'ttml' : 'srt'));
-      if (typeof IDM !== 'undefined') IDM.subData(a, location.href, label || '', ext, String(t));
+      send('subData', [a, location.href, label || '', ext, String(t)]);
     } catch (e) {}
   }
   // Player ayarlarındaki (JSON) altyazı listeleri: {"file":"..","label":"Türkçe","kind":"captions"}
@@ -167,7 +184,7 @@ object Hook {
           var tu = new URL(trs[q].getAttribute('src'), location.href).href;
           if (/^https?:/i.test(tu) && !seen[tu]) {
             seen[tu] = 1;
-            if (typeof IDM !== 'undefined') IDM.sub(tu, location.href, trs[q].label || trs[q].srclang || '');
+            send('sub', [tu, location.href, trs[q].label || trs[q].srclang || '']);
           }
         } catch (e) {}
       }
@@ -215,9 +232,10 @@ object Hook {
   try {
     var ud = navigator.userAgentData;
     var ok = ud && ud.brands && ud.brands.some(function(b){ return b.brand === 'Google Chrome'; });
-    if (!ok && typeof IDM !== 'undefined' && IDM.chromeMajor) {
-      var major = String(IDM.chromeMajor());
-      var mob = !!IDM.isMobile();
+    if (!ok) {
+      var um2 = /Chrome\/(\d+)/.exec(navigator.userAgent);
+      var major = um2 ? um2[1] : '130';
+      var mob = /Mobile/.test(navigator.userAgent);
       var plat = mob ? 'Android' : 'Windows';
       var brands = [{brand:'Chromium',version:major},{brand:'Google Chrome',version:major},{brand:'Not_A Brand',version:'24'}];
       var shim = {
