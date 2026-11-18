@@ -31,7 +31,8 @@ object Hook {
     try {
       if (!t || t.indexOf('http') < 0) return;
       if (t.length > 4000000) t = t.substring(0, 4000000);
-      t = t.replace(/\\\//g, '/').replace(/\\u0026/g, '&').replace(/&amp;/g, '&');
+      t = t.replace(/\\\//g, '/').replace(/\\u0026/g, '&').replace(/&amp;/g, '&').replace(/&quot;/g, '"');
+      scanTracks(t);
       var re = /https?:\/\/[^\s"'<>\\()]+/g, m, c = 0;
       while ((m = re.exec(t)) && c < 60) {
         if (MEDIA.test(m[0])) { rep(m[0], kindOf(m[0])); c++; }
@@ -48,6 +49,59 @@ object Hook {
     if (/^(video|audio)\//.test(ct) && (!len || len > 800000)) rep(u, 'video');
   }
 
+  // ---- Altyazı yakalama: içerik WEBVTT/SRT/ASS/TTML ise adres/uzantı ne olursa olsun al ----
+  function isSubText(t){
+    try {
+      if (!t) return false;
+      var s = String(t).substring(0, 3000).replace(/^\uFEFF/, '').trim();
+      if (/^WEBVTT/.test(s)) return true;
+      if (/^\d+\s*\r?\n\d{1,2}:\d\d:\d\d[,.]\d{1,3}\s*-->/.test(s)) return true;
+      if (/^\[Script Info\]/i.test(s)) return true;
+      if (/<tt[\s>]/.test(s) && /(ttml|xml:lang)/i.test(s)) return true;
+    } catch (e) {}
+    return false;
+  }
+  function repSub(u, label){
+    try {
+      u = String(u);
+      try { u = new URL(u, location.href).href; } catch (e) { return; }
+      if (!/^https?:/i.test(u) || seen[u]) return;
+      seen[u] = 1;
+      if (typeof IDM !== 'undefined') IDM.sub(u, location.href, label || '');
+    } catch (e) {}
+  }
+  function repSubData(u, t, label){
+    try {
+      if (!t || t.length > 1500000) return;
+      var a = String(u);
+      if (!/^blob:/i.test(a)) { try { a = new URL(a, location.href).href; } catch (e) { return; } }
+      var key = 'D' + a;
+      if (seen[key]) return;
+      seen[key] = 1;
+      var h = String(t).substring(0, 600).replace(/^\uFEFF/, '').trim();
+      var ext = /^WEBVTT/.test(h) ? 'vtt' : (/^\[Script Info\]/i.test(h) ? 'ass' : (/<tt[\s>]/.test(h) ? 'ttml' : 'srt'));
+      if (typeof IDM !== 'undefined') IDM.subData(a, location.href, label || '', ext, String(t));
+    } catch (e) {}
+  }
+  // Player ayarlarındaki (JSON) altyazı listeleri: {"file":"..","label":"Türkçe","kind":"captions"}
+  function scanTracks(t){
+    try {
+      var re = /\{[^{}]{0,700}\}/g, m, c = 0;
+      while ((m = re.exec(t)) && c < 40) {
+        var o = m[0];
+        var strict = /"kind"\s*:\s*"(captions|subtitles)"|srclang/i.test(o);
+        var um = /https?:\/\/[^"'\\\s]+/.exec(o);
+        if (!um) continue;
+        if (/\.(jpe?g|png|gif|webp|svg|js|css|mp4|m3u8|ts|ico)(\?|$)/i.test(um[0])) continue;
+        var loose = /"label"/i.test(o) && /(sub|caption|altyaz|vtt|srt|[\/_.=-](tur|eng|tr|en)[\/_.&-])/i.test(um[0]);
+        if (!strict && !loose) continue;
+        var lm = /"(?:label|name|title)"\s*:\s*"([^"]*)"/i.exec(o);
+        repSub(um[0], lm ? lm[1] : '');
+        c++;
+      }
+    } catch (e) {}
+  }
+
   var xo = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function(m, u){
     var self = this, url = u;
@@ -61,6 +115,7 @@ object Hook {
         if (self.responseType === '' || self.responseType === 'text') {
           var t = self.responseText;
           if (!t || t.length > 3000000) return;
+          if (isSubText(t)) { repSubData(url, t, ''); return; }
           if (t.indexOf('#EXTM3U') === 0) rep(url, 'hls');
           else if (t.indexOf('<MPD') >= 0 && t.length < 2000000) rep(url, 'dash');
           else scanText(t);
@@ -86,6 +141,7 @@ object Hook {
             if ((textual && (!cl || cl < 1500000)) || smallBin) {
               r.clone().text().then(function(t){
                 if (!t) return;
+                if (isSubText(t)) { repSubData(url, t, ''); return; }
                 if (t.indexOf('#EXTM3U') === 0) rep(url, 'hls');
                 else if (t.indexOf('<MPD') >= 0) rep(url, 'dash');
                 else scanText(t);
@@ -135,6 +191,20 @@ object Hook {
   document.addEventListener('DOMContentLoaded', function(){ setTimeout(window.__idmScan, 800); });
   window.addEventListener('load', function(){ setTimeout(window.__idmScan, 1200); setTimeout(window.__idmScan, 5000); });
   document.addEventListener('play', function(){ setTimeout(window.__idmScan, 500); }, true);
+
+  // blob: ile üretilen altyazılar (player metni indirip blob yapar)
+  try {
+    var cou = URL.createObjectURL;
+    URL.createObjectURL = function(o){
+      var u = cou.apply(this, arguments);
+      try {
+        if (o && typeof Blob !== 'undefined' && o instanceof Blob && o.size > 20 && o.size < 1500000 && !/^(video|audio|image)\//.test(o.type || '')) {
+          o.text().then(function(t){ if (isSubText(t)) repSubData(u, t, ''); }).catch(function(){});
+        }
+      } catch (e) {}
+      return u;
+    };
+  } catch (e) {}
 
   // ---- Chrome kimliği: window.chrome ve userAgentData (Chrome markası) ----
   try {
