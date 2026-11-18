@@ -24,7 +24,7 @@ object Hook {
     var q = __q; __q = [];
     for (var i = 0; i < q.length; i++) { try { __call(q[i][0], q[i][1]); } catch (e) {} }
   }, 600);
-  var MEDIA = /\.(mp4|m3u8|mpd|mkv|webm|mp3|m4a|flv|avi|mov|aac|ogg|opus|wav|zip|rar|7z|apk|pdf|iso|srt|vtt|ass|ssa|ttml|dfxp|sbv)(\?|#|&|$)/i;
+  var MEDIA = /\.(mp4|m4v|mkv|webm|mov|avi|wmv|flv|f4v|3gp|3g2|mpg|mpeg|mpv|ogv|vob|m2ts|mts|asf|rmvb|divx|m3u8|mpd|mp3|m4a|aac|ogg|oga|opus|wav|flac|wma|amr|mka|ac3|zip|rar|7z|tar|gz|tgz|bz2|xz|apk|pdf|iso|exe|msi|dmg|docx|xlsx|pptx|epub|srt|vtt|ass|ssa|ttml|dfxp|sbv)(\?|#|&|$)/i;
 
   function kindOf(u){
     var p = String(u).split('?')[0].toLowerCase();
@@ -50,6 +50,7 @@ object Hook {
       if (t.length > 4000000) t = t.substring(0, 4000000);
       t = t.replace(/\\\//g, '/').replace(/\\u0026/g, '&').replace(/&amp;/g, '&').replace(/&quot;/g, '"');
       scanTracks(t);
+      scanKeys(t);
       var re = /https?:\/\/[^\s"'<>\\()]+/g, m, c = 0;
       while ((m = re.exec(t)) && c < 60) {
         if (MEDIA.test(m[0])) { rep(m[0], kindOf(m[0])); c++; }
@@ -116,6 +117,23 @@ object Hook {
         repSub(um[0], lm ? lm[1] : '');
         c++;
       }
+    } catch (e) {}
+  }
+
+  // Uzantısız ama bilinen anahtarlı video adresleri (VK url720/hls, OK.ru videos[], contentUrl ...)
+  function scanKeys(t){
+    try {
+      var s = t.replace(/\\"/g, '"');
+      var re = /"(url(?:144|240|360|480|720|1080|1440|2160)|hls|hls_ondemand|hls_live|hlsManifestUrl|ondemandHls|hlsMasterPlaylistUrl|dash_sep|dash_webm|dash_uni|ondemandDash|metadataWebmUrl|postlive_mp4|video_url|videoUrl|stream_url|streamUrl|play_url|playUrl|download_url|downloadUrl|contentUrl)"\s*:\s*"(https?:\/\/[^"\s]+)"/g, m, c = 0;
+      while ((m = re.exec(s)) && c < 40) {
+        var u = m[2];
+        if (/\.(jpe?g|png|gif|webp|svg|js|css|ico|woff2?|ttf|html?|json|vtt|srt)(\?|$)/i.test(u)) continue;
+        var kind = (/hls|m3u8/i.test(m[1]) || /\.m3u8/i.test(u)) ? 'hls' : ((/dash|mpd|webm/i.test(m[1]) || /\.mpd/i.test(u)) ? 'dash' : 'video');
+        rep(u, kind);
+        c++;
+      }
+      var re2 = /"name"\s*:\s*"(mobile|lowest|low|sd|hd|full|quad|ultra)"\s*,\s*"url"\s*:\s*"(https?:\/\/[^"\s]+)"/g;
+      while ((m = re2.exec(s)) && c < 60) { rep(m[2], 'video'); c++; }
     } catch (e) {}
   }
 
