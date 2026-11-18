@@ -38,6 +38,11 @@ object U {
         "m4a" -> "audio/mp4"
         "webm" -> "video/webm"
         "flv" -> "video/x-flv"
+        "srt" -> "application/x-subrip"
+        "vtt" -> "text/vtt"
+        "ass", "ssa" -> "text/x-ssa"
+        "ttml", "dfxp" -> "application/ttml+xml"
+        "sbv" -> "text/plain"
         else -> MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "application/octet-stream"
     }
 
