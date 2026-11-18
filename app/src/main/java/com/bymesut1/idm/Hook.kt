@@ -7,10 +7,11 @@ object Hook {
   if (window.__idmHooked) return;
   window.__idmHooked = true;
   var seen = {};
-  var MEDIA = /\.(mp4|m3u8|mpd|mkv|webm|mp3|m4a|flv|avi|mov|aac|ogg|opus|wav|zip|rar|7z|apk|pdf|iso)(\?|#|&|$)/i;
+  var MEDIA = /\.(mp4|m3u8|mpd|mkv|webm|mp3|m4a|flv|avi|mov|aac|ogg|opus|wav|zip|rar|7z|apk|pdf|iso|srt|vtt|ass|ssa|ttml|dfxp|sbv)(\?|#|&|$)/i;
 
   function kindOf(u){
     var p = String(u).split('?')[0].toLowerCase();
+    if (/\.(srt|vtt|ass|ssa|ttml|dfxp|sbv)$/.test(p)) return 'sub';
     if (/\.m3u8$/.test(p)) return 'hls';
     if (/\.mpd$/.test(p)) return 'dash';
     return 'video';
@@ -40,6 +41,7 @@ object Hook {
   function chk(u, ct, cl){
     ct = (ct || '').toLowerCase();
     var len = parseInt(cl || '0', 10);
+    if (ct.indexOf('vtt') >= 0 || ct.indexOf('subrip') >= 0 || ct.indexOf('ttml') >= 0) { rep(u, 'sub'); return; }
     if (ct.indexOf('mpegurl') >= 0) { rep(u, 'hls'); return; }
     if (ct.indexOf('dash+xml') >= 0) { rep(u, 'dash'); return; }
     if (ct.indexOf('video/mp2t') >= 0) return;
@@ -102,6 +104,16 @@ object Hook {
       for (var i = 0; i < els.length; i++) {
         var s = els[i].currentSrc || els[i].src || els[i].getAttribute('src');
         if (s) rep(s, kindOf(s));
+      }
+      var trs = document.querySelectorAll('track[src]');
+      for (var q = 0; q < trs.length; q++) {
+        try {
+          var tu = new URL(trs[q].getAttribute('src'), location.href).href;
+          if (/^https?:/i.test(tu) && !seen[tu]) {
+            seen[tu] = 1;
+            if (typeof IDM !== 'undefined') IDM.sub(tu, location.href, trs[q].label || trs[q].srclang || '');
+          }
+        } catch (e) {}
       }
       var as = document.querySelectorAll('a[href]');
       for (var j = 0; j < as.length && j < 3000; j++) {
