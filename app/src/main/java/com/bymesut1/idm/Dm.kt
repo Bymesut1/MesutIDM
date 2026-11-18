@@ -37,6 +37,7 @@ class Found(
     val pri: Int = 0
 ) {
     var mime: String = ""
+    @Volatile var data: String? = null
 
     companion object {
         const val FILE = 0
@@ -200,6 +201,18 @@ object Dm {
 
     // ---------------------------------------------------------------- Normal dosya
     private fun doFile(d: Item, j: Job) {
+        val inl = d.f.data
+        if (inl != null) {
+            // Sayfadan yakalanan altyazı metni: yeniden indirmeden doğrudan kaydet
+            val tf = j.tmp("f")
+            tf.writeText(inl, Charsets.UTF_8)
+            d.segments = false
+            d.total = tf.length()
+            d.done.set(tf.length())
+            d.state = "Kaydediliyor"
+            d.uri = publish(tf, d.name)
+            return
+        }
         val p = probe(d, d.f.url)
         if (U.extOf(d.name) !in SUB_EXT && looksPlaylist(d, p)) {
             doHls(d, j, d.f.url)
