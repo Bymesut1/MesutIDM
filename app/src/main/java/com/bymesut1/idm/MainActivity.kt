@@ -102,11 +102,13 @@ class MainActivity : Activity() {
     private var chFull = "130.0.0.0"
 
     private val mediaRe = Regex(
-        "\\.(mp4|m3u8|mpd|mkv|webm|mp3|m4a|flv|avi|mov|aac|ogg|opus|wav|zip|rar|7z|apk|pdf|iso)(\\?|&|#|$)",
+        "\\.(mp4|m3u8|mpd|mkv|webm|mp3|m4a|flv|avi|mov|aac|ogg|opus|wav|zip|rar|7z|apk|pdf|iso|srt|vtt|ass|ssa|ttml|dfxp|sbv)(\\?|&|#|$)",
         RegexOption.IGNORE_CASE
     )
     private val segRe = Regex("\\.(ts|m4s|m4f|cmfv|cmfa|vtt|webvtt|srt)$", RegexOption.IGNORE_CASE)
-    private val knownExt = setOf("mp4", "mkv", "webm", "mp3", "m4a", "flv", "avi", "mov", "aac", "ogg", "opus", "wav", "zip", "rar", "7z", "apk", "pdf", "iso")
+    private val knownExt = setOf("mp4", "mkv", "webm", "mp3", "m4a", "flv", "avi", "mov", "aac", "ogg", "opus", "wav", "zip", "rar", "7z", "apk", "pdf", "iso", "srt", "vtt", "ass", "ssa", "ttml", "dfxp", "sbv")
+    private val subExt = setOf("srt", "vtt", "ass", "ssa", "ttml", "dfxp", "sbv")
+    private val subSegRe = Regex("(seg|segment|chunk|frag|fragment)[-_]?\\d+|/\\d+\\.(web)?vtt$", RegexOption.IGNORE_CASE)
 
     private fun dp(i: Int) = (i * resources.displayMetrics.density).toInt()
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
@@ -116,6 +118,11 @@ class MainActivity : Activity() {
         @JavascriptInterface
         fun found(url: String, page: String, kind: String) {
             runOnUiThread { addFound(tab, url, page, kind) }
+        }
+
+        @JavascriptInterface
+        fun sub(url: String, page: String, label: String) {
+            runOnUiThread { addSub(tab, url, page, label, null) }
         }
 
         @JavascriptInterface
@@ -447,6 +454,10 @@ class MainActivity : Activity() {
         val u = r.url.toString()
         val ref = r.requestHeaders?.get("Referer") ?: ""
         val hasRange = r.requestHeaders?.containsKey("Range") == true
+        if (u.contains("/api/timedtext")) {
+            runOnUiThread { addYtCaption(t, u, ref) }
+            return
+        }
         if (mediaRe.containsMatchIn(u)) runOnUiThread { addFound(t, u, ref, "") }
         else if (hasRange) runOnUiThread { probeAmbiguous(t, u, ref) }
     }
@@ -603,6 +614,10 @@ class MainActivity : Activity() {
         if (!(u.startsWith("http://") || u.startsWith("https://"))) return
         if (t.found.containsKey(u)) return
         val path = u.substringBefore('?')
+        if (kindHint == "sub" || U.extOf(path.substringAfterLast('/')) in subExt) {
+            addSub(t, u, page, "", null)
+            return
+        }
         if (segRe.containsMatchIn(path)) return
         val host = U.host(u)
         if (host.endsWith("googlevideo.com")) return
@@ -626,6 +641,71 @@ class MainActivity : Activity() {
         t.found[u] = f
         refreshBtn()
         probeFound(t, f)
+        if (kind == Found.HLS || kind == Found.DASH) probeSubs(t, f)
+    }
+
+    // Altyazı dosyası (.srt/.vtt/...) ekle
+    private fun addSub(t: Tab, u0: String, page: String, label: String, forceExt: String?) {
+        val u = u0.substringBefore('#')
+        if (!(u.startsWith("http://") || u.startsWith("https://"))) return
+        if (t.found.containsKey(u)) return
+        val path = u.substringBefore('?')
+        if (subSegRe.containsMatchIn(path)) return
+        val file = path.substringAfterLast('/')
+        val g = U.extOf(file)
+        val ext = forceExt ?: if (g in subExt) g else "vtt"
+        val lab = label.ifBlank { U.baseName(file).take(30) }
+        val title = (t.web.title ?: "").trim().ifBlank { U.host(u).ifBlank { "video" } }
+        val f = Found(
+            u, U.safe(title).take(70) + (if (lab.isNotBlank()) " [" + U.safe(lab) + "]" else "") + "." + ext,
+            page.ifBlank { t.web.url ?: "" }, Found.FILE, null,
+            "Altyazı" + (if (lab.isNotBlank()) " ($lab)" else "") + " • " + ext.uppercase()
+        )
+        t.found[u] = f
+        refreshBtn()
+        probeFound(t, f)
+    }
+
+    // YouTube oynatıcısı altyazı isteyince (CC açılınca) SRT olarak ekle
+    private fun addYtCaption(t: Tab, u: String, ref: String) {
+        val lang = Regex("[?&]lang=([^&]+)").find(u)?.groupValues?.get(1) ?: "?"
+        val clean = u.replace(Regex("&fmt=[^&]*"), "") + "&fmt=srt"
+        addSub(t, clean, ref, "YouTube $lang", "srt")
+    }
+
+    // HLS master / DASH içindeki altyazı kanallarını bul
+    private fun probeSubs(t: Tab, f: Found) {
+        val ua = t.web.settings.userAgentString
+        val ck = CookieManager.getInstance().getCookie(f.url) ?: ""
+        val titleBase = U.baseName(f.name)
+        probePool.execute {
+            try {
+                val txt = Net.text(f.url, ua, f.referer, ck)
+                val list = if (f.kind == Found.HLS) Hls.subs(f.url, txt) else Dash.subtitles(f.url, txt)
+                if (list.isNotEmpty()) {
+                    runOnUiThread {
+                        for (x in list) {
+                            if (t.found.containsKey(x.second)) continue
+                            if (f.kind == Found.HLS) {
+                                t.found[x.second] = Found(
+                                    x.second, U.safe(titleBase).take(70) + " [" + U.safe(x.first) + "].vtt", f.referer,
+                                    Found.SUBHLS, null, "Altyazı (${x.first}) • HLS"
+                                )
+                            } else {
+                                val ge = U.extOf(x.second.substringBefore('?').substringAfterLast('/'))
+                                val ex = if (ge in subExt) ge else "vtt"
+                                t.found[x.second] = Found(
+                                    x.second, U.safe(titleBase).take(70) + " [" + U.safe(x.first) + "]." + ex, f.referer,
+                                    Found.FILE, null, "Altyazı (${x.first}) • ${ex.uppercase()}"
+                                )
+                            }
+                        }
+                        refreshBtn()
+                    }
+                }
+            } catch (e: Exception) {
+            }
+        }
     }
 
     private fun probeFound(t: Tab, f: Found) {
@@ -653,7 +733,7 @@ class MainActivity : Activity() {
         if (!t.found.containsKey(f.url)) return
         if (f.kind == Found.FILE) {
             val ext = U.extOf(f.name)
-            val big = ext == "zip" || ext == "rar" || ext == "7z" || ext == "apk" || ext == "pdf" || ext == "iso"
+            val big = ext == "zip" || ext == "rar" || ext == "7z" || ext == "apk" || ext == "pdf" || ext == "iso" || ext in subExt
             if (ct.startsWith("text/html") || ct.startsWith("image/") || (!big && total in 1..150_000L)) {
                 t.found.remove(f.url)
                 refreshBtn()
@@ -750,7 +830,8 @@ class MainActivity : Activity() {
                     }
                     k + (if (f.size > 0) " • " + U.fmt(f.size) else "")
                 }
-                v.findViewById<TextView>(android.R.id.text2).text = desc + "  •  " + U.host(f.url)
+                val tail = f.url.substringBefore('?').substringAfterLast('/').takeLast(30)
+                v.findViewById<TextView>(android.R.id.text2).text = desc + "  •  " + U.host(f.url) + (if (tail.isNotEmpty()) "/…" + tail else "")
                 return v
             }
         }
