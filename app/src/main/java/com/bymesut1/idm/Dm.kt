@@ -43,6 +43,7 @@ class Found(
         const val HLS = 1
         const val DASH = 2
         const val PAIR = 3
+        const val SUBHLS = 4
     }
 }
 
@@ -79,6 +80,7 @@ object Dm {
     private const val PARTS = 8
     private const val SEG_THREADS = 8
     private const val SEG_WINDOW = 16
+    private val SUB_EXT = setOf("srt", "vtt", "ass", "ssa", "ttml", "dfxp", "sbv")
     private val BIN_EXT = setOf(
         "mp4", "mkv", "webm", "mp3", "m4a", "flv", "avi", "mov", "zip", "rar", "7z",
         "apk", "pdf", "iso", "ogg", "wav", "aac", "opus"
@@ -155,6 +157,7 @@ object Dm {
                 Found.HLS -> doHls(d, j, d.f.url)
                 Found.DASH -> doDash(d, j)
                 Found.PAIR -> doPair(d, j)
+                Found.SUBHLS -> doSubHls(d, j)
                 else -> doFile(d, j)
             }
             alive(d)
@@ -198,7 +201,7 @@ object Dm {
     // ---------------------------------------------------------------- Normal dosya
     private fun doFile(d: Item, j: Job) {
         val p = probe(d, d.f.url)
-        if (looksPlaylist(d, p)) {
+        if (U.extOf(d.name) !in SUB_EXT && looksPlaylist(d, p)) {
             doHls(d, j, d.f.url)
             return
         }
@@ -216,8 +219,38 @@ object Dm {
         val t = j.tmp("f")
         download(d, p, t)
         alive(d)
+        if (t.length() == 0L) throw Exception("Sunucu boş dosya döndürdü (link süresi dolmuş / izin gerekli olabilir)")
         d.state = "Kaydediliyor"
         d.uri = publish(t, d.name)
+    }
+
+    // HLS altyazı kanalı: vtt parçalarını indirip tek .vtt dosyasında birleştirir.
+    private fun doSubHls(d: Item, j: Job) {
+        d.segments = true
+        val pl = text(d, d.f.url)
+        val m = Hls.media(d.f.url, pl) { u -> bytesOf(d, u) }
+        d.total = m.segs.size.toLong()
+        d.done.set(0)
+        val sb = StringBuilder()
+        var first = true
+        for (s in m.segs) {
+            alive(d)
+            var t = String(segment(d, s, false), Charsets.UTF_8).replace("\r\n", "\n")
+            if (!first && t.trimStart('\uFEFF').startsWith("WEBVTT")) {
+                val idx = t.indexOf("\n\n")
+                t = if (idx >= 0) t.substring(idx + 2) else ""
+            }
+            if (sb.isNotEmpty() && !sb.endsWith("\n")) sb.append("\n")
+            sb.append(t)
+            first = false
+            d.done.incrementAndGet()
+        }
+        val f = j.tmp("s")
+        f.writeText(sb.toString(), Charsets.UTF_8)
+        alive(d)
+        d.state = "Kaydediliyor"
+        d.name = U.safe(d.name)
+        d.uri = publish(f, d.name)
     }
 
     private fun looksPlaylist(d: Item, p: Probe): Boolean {
