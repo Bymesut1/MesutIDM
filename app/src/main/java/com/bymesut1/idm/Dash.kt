@@ -57,6 +57,34 @@ object Dash {
         return s.replace("\$\$", "\$")
     }
 
+    /** MPD içindeki tek dosyalık altyazı kanalları: (dil, adres). */
+    fun subtitles(mpdUrl: String, xml: String): List<Pair<String, String>> {
+        val out = ArrayList<Pair<String, String>>()
+        try {
+            val dbf = DocumentBuilderFactory.newInstance()
+            dbf.isNamespaceAware = false
+            val doc = dbf.newDocumentBuilder().parse(InputSource(StringReader(xml)))
+            val mpd = doc.documentElement
+            val baseM = join(mpdUrl, baseText(mpd))
+            for (period in kids(mpd, "Period")) {
+                val baseP = join(baseM, baseText(period))
+                for (aset in kids(period, "AdaptationSet")) {
+                    val mime = aset.a("mimeType")
+                    val ct = aset.a("contentType")
+                    if (!(ct == "text" || mime.startsWith("text/") || mime.contains("ttml"))) continue
+                    val baseA = join(baseP, baseText(aset))
+                    val lang = aset.a("lang")
+                    for (rep in kids(aset, "Representation")) {
+                        val bt = baseText(rep) ?: continue
+                        out.add(Pair(lang.ifEmpty { rep.a("id") }, join(baseA, bt)))
+                    }
+                }
+            }
+        } catch (e: Exception) {
+        }
+        return out
+    }
+
     fun plan(mpdUrl: String, xml: String): DashPlan {
         val dbf = DocumentBuilderFactory.newInstance()
         dbf.isNamespaceAware = false
