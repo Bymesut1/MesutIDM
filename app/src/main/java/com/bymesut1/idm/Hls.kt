@@ -27,6 +27,21 @@ object Hls {
         return ByteArray(16) { h.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
     }
 
+    /** Master playlist içindeki altyazı kanalları: (ad, adres). */
+    fun subs(url: String, pl: String): List<Pair<String, String>> {
+        val out = ArrayList<Pair<String, String>>()
+        for (ln in pl.lines()) {
+            val t = ln.trim()
+            if (!t.startsWith("#EXT-X-MEDIA:")) continue
+            val a = attrs(t)
+            if (a["TYPE"] != "SUBTITLES") continue
+            val u = a["URI"] ?: continue
+            val name = a["NAME"] ?: a["LANGUAGE"] ?: "altyazı"
+            out.add(Pair(name, resolve(url, u)))
+        }
+        return out
+    }
+
     /** Master playlist ise en yüksek kaliteyi + (ayrı ses varsa) sesini seçer. */
     fun plan(url: String, text: (String) -> String, bytes: (String) -> ByteArray): HlsPlan {
         var pl = text(url)
