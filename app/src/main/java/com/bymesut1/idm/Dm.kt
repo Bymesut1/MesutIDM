@@ -31,12 +31,14 @@ class Found(
     val referer: String,
     val kind: Int = FILE,
     val audioUrl: String? = null,
-    val label: String = "",
+    var label: String = "",
     var size: Long = -1,
     val ua: String? = null,
     val pri: Int = 0
 ) {
     var mime: String = ""
+    var noCookies: Boolean = false      // CDN çerezleri indirmeyi bozuyorsa (OK.ru gibi)
+    var cookie: String? = null          // verilirse yalnızca bu çerez gönderilir (Mail.ru video_key)
     @Volatile var data: String? = null
     @Volatile var dataBytes: ByteArray? = null
 
@@ -62,6 +64,8 @@ class Item(val id: Int, val f: Found, val ua: String, val cookie: String) {
     @Volatile var lastBytes = 0L
     @Volatile var lastTime = 0L
     @Volatile var speed = 0L
+    @Volatile var parts: ByteArray? = null
+    @Volatile var conns = 0
 }
 
 class LimitEx(msg: String) : Exception(msg)
@@ -79,13 +83,14 @@ object Dm {
     val items = CopyOnWriteArrayList<Item>()
     private val pool = Executors.newCachedThreadPool()
     private var nextId = 1
-    private const val PARTS = 8
-    private const val SEG_THREADS = 8
+    @Volatile var connections = 8
     private const val SEG_WINDOW = 16
     private val SUB_EXT = setOf("srt", "vtt", "ass", "ssa", "ttml", "dfxp", "sbv")
     private val BIN_EXT = setOf(
-        "mp4", "mkv", "webm", "mp3", "m4a", "flv", "avi", "mov", "zip", "rar", "7z",
-        "apk", "pdf", "iso", "ogg", "wav", "aac", "opus"
+        "mp4", "m4v", "mkv", "webm", "mp3", "m4a", "flv", "avi", "mov", "wmv", "f4v", "3gp", "3g2",
+        "mpg", "mpeg", "mpv", "ogv", "vob", "m2ts", "mts", "ts", "asf", "rm", "rmvb", "divx",
+        "zip", "rar", "7z", "tar", "gz", "tgz", "bz2", "xz", "apk", "pdf", "iso", "exe", "msi", "dmg",
+        "ogg", "oga", "wav", "flac", "wma", "amr", "mka", "ac3", "aac", "opus"
     )
 
     fun setup(ctx: Context) {
@@ -189,8 +194,32 @@ object Dm {
         throw last ?: Exception("Hata")
     }
 
-    private fun text(d: Item, u: String): String = retry(3) { Net.text(u, d.ua, d.f.referer, d.cookie) }
-    private fun bytesOf(d: Item, u: String): ByteArray = retry(3) { Net.bytes(u, d.ua, d.f.referer, d.cookie) }
+    // Tüm isteklerin ortak çıkışı: çerez / referer / özel çerez kuralları burada uygulanır
+    private fun dopen(d: Item, url: String, range: String?): Conn {
+        val ex = d.f.cookie
+        return if (ex != null) Net.open(url, d.ua, d.f.referer, "", range, null, mapOf("Cookie" to ex), false)
+        else Net.open(url, d.ua, d.f.referer, d.cookie, range, null, null, !d.f.noCookies)
+    }
+
+    private fun text(d: Item, u: String): String = retry(3) {
+        val k = dopen(d, u, null)
+        try {
+            if (k.code !in 200..299) throw Exception("HTTP ${k.code}")
+            k.c.inputStream.bufferedReader().use { it.readText() }
+        } finally {
+            k.c.disconnect()
+        }
+    }
+
+    private fun bytesOf(d: Item, u: String): ByteArray = retry(3) {
+        val k = dopen(d, u, null)
+        try {
+            if (k.code !in 200..299) throw Exception("HTTP ${k.code}")
+            k.c.inputStream.use { it.readBytes() }
+        } finally {
+            k.c.disconnect()
+        }
+    }
 
     private fun checkSpace(d: Item) {
         if (d.total > 0 && !d.segments) {
@@ -333,7 +362,11 @@ object Dm {
         d.segments = true
         val plan = Hls.plan(url, { u -> text(d, u) }, { u -> bytesOf(d, u) })
         alive(d)
-        val audio = plan.audio
+        var audio = plan.audio
+        val extraAudio = d.f.audioUrl
+        if (audio == null && extraAudio != null) {
+            audio = Hls.media(extraAudio, text(d, extraAudio)) { u -> bytesOf(d, u) }
+        }
         d.total = (plan.video.segs.size + (audio?.segs?.size ?: 0)).toLong()
         d.done.set(0)
         val vf = j.tmp("v")
@@ -459,7 +492,7 @@ object Dm {
         for (attempt in 0 until 2) {
             try {
                 val rng = if (attempt == 0) "bytes=0-0" else null
-                val k = Net.open(url, d.ua, d.f.referer, d.cookie, rng)
+                val k = dopen(d, url, rng)
                 try {
                     val code = k.code
                     val ct = (k.c.contentType ?: "").lowercase()
@@ -498,12 +531,15 @@ object Dm {
     private fun multi(d: Item, p: Probe, tmp: File) {
         val size = p.total
         RandomAccessFile(tmp, "rw").use { it.setLength(size) }
-        val chunk = (size / 40).coerceIn(1L shl 20, 8L shl 20)
+        val chunk = (size / 64).coerceIn(256L * 1024, 8L shl 20)
         val n = ((size + chunk - 1) / chunk).toInt()
+        val st = ByteArray(n)
+        d.parts = st
         val queue = ConcurrentLinkedQueue<Int>()
         for (i in 0 until n) queue.add(i)
         val failure = AtomicReference<Exception?>(null)
-        val workers = if (size < 8_000_000L) 4 else minOf(PARTS, n)
+        val workers = minOf(connections.coerceAtLeast(1), n)
+        d.conns = workers
         val alive = AtomicInteger(workers)
         val limits = AtomicInteger(0)
         val threads = (0 until workers).map {
@@ -514,12 +550,15 @@ object Dm {
                     raf = r
                     while (!d.cancelled && failure.get() == null) {
                         val i = queue.poll() ?: break
+                        st[i] = 1
                         val s = i.toLong() * chunk
                         val e = minOf(size - 1, s + chunk - 1)
                         try {
                             fetchChunk(d, p, r, s, e)
+                            if (!d.cancelled) st[i] = 2
                         } catch (ex: LimitEx) {
                             queue.add(i)
+                            st[i] = 0
                             if (limits.incrementAndGet() > 40) {
                                 failure.compareAndSet(null, ex)
                             } else if (alive.get() > 1) {
@@ -554,7 +593,7 @@ object Dm {
         while (pos <= end && !d.cancelled) {
             try {
                 val u = if (tries % 2 == 0) p.finalUrl else d.f.url
-                val k = Net.open(u, d.ua, d.f.referer, d.cookie, "bytes=$pos-$end")
+                val k = dopen(d, u, "bytes=$pos-$end")
                 try {
                     val code = k.code
                     if (code == 429 || code == 503) throw LimitEx("HTTP $code")
@@ -603,7 +642,7 @@ object Dm {
                 try {
                     val range = if (pos > 0) "bytes=$pos-" else null
                     val u = if (tries % 2 == 0) p.finalUrl else d.f.url
-                    val k = Net.open(u, d.ua, d.f.referer, d.cookie, range)
+                    val k = dopen(d, u, range)
                     try {
                         val code = k.code
                         if (pos > 0 && code == 200) {
@@ -658,7 +697,7 @@ object Dm {
         val failure = AtomicReference<Exception?>(null)
         val lock = ReentrantLock()
         val cond = lock.newCondition()
-        val threads = (0 until minOf(SEG_THREADS, n)).map {
+        val threads = (0 until minOf(connections.coerceAtLeast(1), n)).map {
             Thread {
                 try {
                     while (d.cancelled.not() && failure.get() == null) {
@@ -738,7 +777,7 @@ object Dm {
         while (true) {
             if (d.cancelled) throw Exception("İptal")
             try {
-                val k = Net.open(s.url, d.ua, d.f.referer, d.cookie, s.range)
+                val k = dopen(d, s.url, s.range)
                 try {
                     val code = k.code
                     if (code != 200 && code != 206) throw Exception("HTTP $code")
