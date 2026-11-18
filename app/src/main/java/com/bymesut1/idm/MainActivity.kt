@@ -63,6 +63,7 @@ class MainActivity : Activity() {
         val found = LinkedHashMap<String, Found>()
         val seen = HashSet<String>()
         var ytLast = ""
+        var lastPage = ""
         var desktop = false
     }
 
@@ -112,6 +113,9 @@ class MainActivity : Activity() {
 
     private val subHintRe = Regex("(subtitle|caption|altyaz|/subs?/|[?&](lang|language|srclang)=|[/_.-](vtt|srt)([/_.?&-]|$))")
     private val staticRe = Regex("\\.(js|css|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|otf|html?|map)$")
+
+    private val netLog = ArrayDeque<String>()
+    private val logSkipRe = Regex("\\.(ts|m4s|js|css|png|jpe?g|gif|webp|avif|svg|ico|woff2?|ttf|otf|map)$")
 
     private fun dp(i: Int) = (i * resources.displayMetrics.density).toInt()
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
@@ -460,6 +464,7 @@ class MainActivity : Activity() {
 
     private fun sniff(t: Tab, r: WebResourceRequest) {
         val u = r.url.toString()
+        logNet(u)
         val ref = r.requestHeaders?.get("Referer") ?: ""
         val hasRange = r.requestHeaders?.containsKey("Range") == true
         if (u.contains("/api/timedtext")) {
@@ -503,6 +508,16 @@ class MainActivity : Activity() {
         }
 
         override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+            if (url != null && url != t.lastPage) {
+                // Yeni sayfa: eski sayfanın bulunanlarını temizle (listeyi karıştırma)
+                t.lastPage = url
+                val keep = t.found[url]
+                t.found.clear()
+                t.seen.clear()
+                t.ytLast = ""
+                if (keep != null) t.found[url] = keep
+                if (t === cur) refreshBtn()
+            }
             if (t === cur && url != null) urlBar.setText(url)
         }
 
@@ -771,6 +786,10 @@ class MainActivity : Activity() {
     }
 
     private fun probeFound(t: Tab, f: Found) {
+        if (f.kind == Found.FILE && U.extOf(f.name) in subExt) {
+            fetchSubData(t, f)
+            return
+        }
         val ua = t.web.settings.userAgentString
         val ck = CookieManager.getInstance().getCookie(f.url) ?: ""
         probePool.execute {
@@ -796,7 +815,7 @@ class MainActivity : Activity() {
         if (f.kind == Found.FILE) {
             val ext = U.extOf(f.name)
             val big = ext == "zip" || ext == "rar" || ext == "7z" || ext == "apk" || ext == "pdf" || ext == "iso" || ext in subExt
-            if (ct.startsWith("text/html") || ct.startsWith("image/") || (!big && total in 1..150_000L)) {
+            if (ext !in subExt && (ct.startsWith("text/html") || ct.startsWith("image/") || (!big && total in 1..150_000L))) {
                 t.found.remove(f.url)
                 refreshBtn()
                 return
@@ -844,6 +863,83 @@ class MainActivity : Activity() {
         }
     }
 
+    // ------------------------------------------------------------------ Tanılama + altyazı içeriği
+    private fun logNet(u: String) {
+        if (logSkipRe.containsMatchIn(u.lowercase().substringBefore('?'))) return
+        synchronized(netLog) {
+            if (netLog.size >= 400) netLog.removeFirst()
+            netLog.addLast(u)
+        }
+    }
+
+    private fun showNetLog() {
+        val list = synchronized(netLog) { netLog.toList() }.asReversed()
+        if (list.isEmpty()) {
+            toast("Henüz istek kaydı yok")
+            return
+        }
+        val shown = list.take(150)
+        AlertDialog.Builder(this)
+            .setTitle("Son ağ istekleri (${shown.size}) • dokun: kopyala")
+            .setItems(shown.map { it.take(160) }.toTypedArray()) { _, i -> copy(shown[i]) }
+            .setNeutralButton("Tümünü kopyala") { _, _ -> copy(shown.joinToString("\n")) }
+            .setPositiveButton("Kapat", null)
+            .show()
+    }
+
+    private fun readLimited(ins: java.io.InputStream, max: Int): ByteArray {
+        val bo = java.io.ByteArrayOutputStream()
+        val buf = ByteArray(8192)
+        var n = 0
+        while (n < max) {
+            val r = ins.read(buf)
+            if (r < 0) break
+            bo.write(buf, 0, r)
+            n += r
+        }
+        return bo.toByteArray()
+    }
+
+    // Altyazı bulunur bulunmaz içeriğini hemen indirip sakla (Referer'ı değiştirerek dener; kodlama korunur)
+    private fun fetchSubData(t: Tab, f: Found) {
+        val ua = t.web.settings.userAgentString
+        val top = t.web.url ?: ""
+        val ck = CookieManager.getInstance().getCookie(f.url) ?: ""
+        val host = U.host(f.url)
+        val refs = LinkedHashSet<String>()
+        if (f.referer.isNotEmpty()) refs.add(f.referer)
+        if (top.isNotEmpty()) refs.add(top)
+        if (host.isNotEmpty()) refs.add("https://$host/")
+        if (refs.isEmpty()) refs.add("")
+        probePool.execute {
+            var ok = false
+            for (ref in refs) {
+                if (ok) break
+                try {
+                    val k = Net.open(f.url, ua, ref, ck)
+                    try {
+                        if (k.code == 200) {
+                            val bytes = k.c.inputStream.use { readLimited(it, 2_000_000) }
+                            val head = String(bytes, 0, minOf(bytes.size, 3000), Charsets.UTF_8)
+                            if (bytes.isNotEmpty() && U.sniffSub(head) != null) {
+                                ok = true
+                                runOnUiThread {
+                                    if (f.dataBytes == null) {
+                                        f.dataBytes = bytes
+                                        f.size = bytes.size.toLong()
+                                    }
+                                }
+                            }
+                        }
+                    } finally {
+                        k.c.disconnect()
+                    }
+                } catch (e: Exception) {
+                }
+            }
+        }
+    }
+
     // ------------------------------------------------------------------ YouTube
     private fun checkYoutube(t: Tab, url: String?) {
         if (url == null) return
@@ -873,7 +969,16 @@ class MainActivity : Activity() {
     // ------------------------------------------------------------------ Bulunanlar listesi
     private fun showFound() {
         val t = cur ?: return
-        val all = t.found.values.toList()
+        val all0 = t.found.values.toList()
+        // Master playlist varsa aynı klasördeki alt (varyant) playlistleri gizle
+        val masterDirs = all0.filter {
+            it.kind == Found.HLS && it.url.substringBefore('?').substringAfterLast('/').lowercase().startsWith("master")
+        }.map { it.url.substringBefore('?').substringBeforeLast('/') }.toSet()
+        val all = all0.filter { f ->
+            !(f.kind == Found.HLS &&
+                !f.url.substringBefore('?').substringAfterLast('/').lowercase().startsWith("master") &&
+                masterDirs.contains(f.url.substringBefore('?').substringBeforeLast('/')))
+        }
         val list = all.filter { it.pri > 0 } + all.filter { it.pri == 0 }.reversed()
         if (list.isEmpty()) {
             Toast.makeText(this, "Henüz medya/dosya bulunamadı. Videoyu oynat veya sayfayı gez.", Toast.LENGTH_LONG).show()
@@ -1212,7 +1317,8 @@ class MainActivity : Activity() {
             "Masaüstü sitesi: " + (if (t.desktop) "AÇIK" else "kapalı"),
             "Sayfada medya tara / yenile",
             "Sayfayı yenile",
-            "Sayfa linkini kopyala"
+            "Sayfa linkini kopyala",
+            "Ağ isteklerini göster (tanılama)"
         )
         AlertDialog.Builder(this)
             .setItems(items) { _, i ->
@@ -1231,7 +1337,8 @@ class MainActivity : Activity() {
                         toast("Taranıyor…")
                     }
                     4 -> t.web.reload()
-                    else -> copy(t.web.url ?: "")
+                    5 -> copy(t.web.url ?: "")
+                    else -> showNetLog()
                 }
             }
             .show()
