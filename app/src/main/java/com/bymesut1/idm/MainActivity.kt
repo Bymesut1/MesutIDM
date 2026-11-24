@@ -146,6 +146,22 @@ class MainActivity : Activity() {
         }
 
         @JavascriptInterface
+        fun saveReport(name: String, text: String) {
+            try {
+                val cv = android.content.ContentValues().apply {
+                    put(android.provider.MediaStore.Downloads.DISPLAY_NAME, name)
+                    put(android.provider.MediaStore.Downloads.MIME_TYPE, "text/plain")
+                    put(android.provider.MediaStore.Downloads.RELATIVE_PATH, "Download")
+                }
+                val uri = contentResolver.insert(android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv)
+                if (uri != null) contentResolver.openOutputStream(uri)?.use { it.write(text.toByteArray(Charsets.UTF_8)) }
+                runOnUiThread { toast("Kaydedildi: İndirilenler/" + name) }
+            } catch (e: Exception) {
+                runOnUiThread { toast("Kaydedilemedi: " + e.message) }
+            }
+        }
+
+        @JavascriptInterface
         fun chromeMajor(): String = chMajor
 
         @JavascriptInterface
@@ -353,7 +369,7 @@ class MainActivity : Activity() {
         }
         val t = cur ?: return
         if (u == null) {
-            if (t.web.url == null) t.web.loadUrl(HOME)
+            if (t.web.url == null) go(t.web, HOME)
             return
         }
         val path = u.substringBefore('?')
@@ -365,7 +381,7 @@ class MainActivity : Activity() {
             }
             confirmDl(Found(u, URLUtil.guessFileName(u, null, null), "", kind))
         } else {
-            t.web.loadUrl(u)
+            go(t.web, u)
         }
     }
 
@@ -377,7 +393,7 @@ class MainActivity : Activity() {
             t.contains(".") && !t.contains(" ") -> "https://$t"
             else -> "https://www.google.com/search?q=" + Uri.encode(t)
         }
-        cur?.web?.loadUrl(u)
+        cur?.web?.let { go(it, u) }
         urlBar.clearFocus()
     }
 
@@ -388,7 +404,7 @@ class MainActivity : Activity() {
         configure(t)
         tabs.add(t)
         showTab(t)
-        if (url != null) t.web.loadUrl(url)
+        if (url != null) go(t.web, url)
         return t
     }
 
@@ -434,6 +450,26 @@ class MainActivity : Activity() {
             .show()
     }
 
+
+    // ---- Chrome gibi görünme: X-Requested-With (uygulama paket adı) hiçbir istekte gitmesin ----
+    private val BRIDGE = "_nbr9x"
+
+    private fun go(w: WebView, url: String) {
+        // Ana belge isteğinde başlığı açıkça boş gönder (eski WebView'larda da işe yarar)
+        if (url.startsWith("http")) w.loadUrl(url, mapOf("X-Requested-With" to "")) else w.loadUrl(url)
+    }
+
+    private fun stripRequestedWith(s: WebSettings) {
+        try {
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.REQUESTED_WITH_HEADER_ALLOW_LIST)) {
+                WebSettingsCompat.setRequestedWithHeaderOriginAllowList(s, emptySet())
+            } else {
+                toast("WebView eski: Android System WebView / Chrome'u güncelleyin")
+            }
+        } catch (e: Exception) {
+        }
+    }
+
     // ------------------------------------------------------------------ WebView ayarı (Chrome gibi)
     private fun configure(t: Tab) {
         val w = t.web
@@ -450,13 +486,11 @@ class MainActivity : Activity() {
         s.builtInZoomControls = true
         s.displayZoomControls = false
         applyIdentity(t)
-        if (WebViewFeature.isFeatureSupported(WebViewFeature.REQUESTED_WITH_HEADER_ALLOW_LIST)) {
-            WebSettingsCompat.setRequestedWithHeaderOriginAllowList(s, emptySet())
-        }
+        stripRequestedWith(s)
         val cm = CookieManager.getInstance()
         cm.setAcceptCookie(true)
         cm.setAcceptThirdPartyCookies(w, true)
-        w.addJavascriptInterface(Bridge(t), "IDM")
+        w.addJavascriptInterface(Bridge(t), BRIDGE)
         if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
             t.hook = WebViewCompat.addDocumentStartJavaScript(w, Hook.JS, setOf("*"))
         }
@@ -1409,7 +1443,7 @@ class MainActivity : Activity() {
 
     private fun histClick(p: Int) {
         val r = histRows.getOrNull(p) ?: return
-        cur?.web?.loadUrl(r.url)
+        cur?.web?.let { go(it, r.url) }
         closePanel()
     }
 
@@ -1466,7 +1500,8 @@ class MainActivity : Activity() {
             "Sayfa linkini kopyala",
             "Ağ isteklerini göster (tanılama)",
             "İndirme bağlantı sayısı: ${Dm.connections}",
-            "Sayfa izleyici (JS): " + (if (t.hook != null) "AÇIK" else "kapalı")
+            "Sayfa izleyici (JS): " + (if (t.hook != null) "AÇIK" else "kapalı"),
+            "Kimlik raporu kaydet (İndirilenler)"
         )
         AlertDialog.Builder(this)
             .setItems(items) { _, i ->
@@ -1490,7 +1525,11 @@ class MainActivity : Activity() {
                     5 -> copy(t.web.url ?: "")
                     6 -> showNetLog()
                     7 -> chooseConns()
-                    else -> toggleHook(t)
+                    8 -> toggleHook(t)
+                    else -> {
+                        t.web.evaluateJavascript(Hook.REPORT_JS, null)
+                        toast("Rapor hazırlanıyor…")
+                    }
                 }
             }
             .show()
