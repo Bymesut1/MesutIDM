@@ -229,6 +229,7 @@ class MainActivity : Activity() {
         super.onCreate(b)
         Dm.setup(this)
         Dm.connections = getSharedPreferences("idm", MODE_PRIVATE).getInt("conns", 8)
+        cleanMode = getSharedPreferences("idm", MODE_PRIVATE).getInt("cleanMode", 2)
         hist = HistoryDb(applicationContext)
         if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
         initIdentity()
@@ -460,7 +461,7 @@ class MainActivity : Activity() {
     }
 
     // ---- Sunucu tarafı WebView tespiti: belge/JSON isteklerini kendimiz Chrome başlıklarıyla yapıyoruz ----
-    @Volatile private var cleanMode = 1   // 0 = kapalı, 1 = sadece sayfalar, 2 = tüm GET istekleri
+    @Volatile private var cleanMode = 2   // 0 = kapalı, 1 = sadece sayfalar, 2 = tüm GET istekleri
     private val cleanFetchOn: Boolean get() = cleanMode > 0
     private fun cleanName(): String = when (cleanMode) { 0 -> "kapalı"; 1 -> "SAYFALAR"; else -> "HER ŞEY" }
 
@@ -556,8 +557,6 @@ class MainActivity : Activity() {
         try {
             if (WebViewFeature.isFeatureSupported(WebViewFeature.REQUESTED_WITH_HEADER_ALLOW_LIST)) {
                 WebSettingsCompat.setRequestedWithHeaderOriginAllowList(s, emptySet())
-            } else {
-                toast("WebView eski: Android System WebView / Chrome'u güncelleyin")
             }
         } catch (e: Exception) {
         }
@@ -1626,6 +1625,7 @@ class MainActivity : Activity() {
                     }
                     else -> {
                         cleanMode = (cleanMode + 1) % 3
+                        getSharedPreferences("idm", MODE_PRIVATE).edit().putInt("cleanMode", cleanMode).apply()
                         toast("Chrome başlık modu: " + cleanName())
                         t.web.reload()
                     }
