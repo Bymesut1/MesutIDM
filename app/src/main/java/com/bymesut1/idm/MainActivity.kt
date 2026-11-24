@@ -525,6 +525,8 @@ class MainActivity : Activity() {
             cm.getCookie(url)?.let { if (it.isNotEmpty()) c.setRequestProperty("Cookie", it) }
 
             val code = c.responseCode
+            // Sayfa dışı isteklerde Chrome-başlıklı istek hata verirse WebView kendi yoluyla denesin
+            if (code >= 400 && !isDoc) { c.disconnect(); return null }
             c.headerFields?.get("Set-Cookie")?.forEach { cm.setCookie(url, it) }
             c.headerFields?.get("set-cookie")?.forEach { cm.setCookie(url, it) }
             cm.flush()
