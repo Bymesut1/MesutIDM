@@ -459,6 +459,99 @@ class MainActivity : Activity() {
         if (url.startsWith("http")) w.loadUrl(url, mapOf("X-Requested-With" to "")) else w.loadUrl(url)
     }
 
+    // ---- Sunucu tarafı WebView tespiti: belge/JSON isteklerini kendimiz Chrome başlıklarıyla yapıyoruz ----
+    @Volatile private var cleanMode = 1   // 0 = kapalı, 1 = sadece sayfalar, 2 = tüm GET istekleri
+    private val cleanFetchOn: Boolean get() = cleanMode > 0
+    private fun cleanName(): String = when (cleanMode) { 0 -> "kapalı"; 1 -> "SAYFALAR"; else -> "HER ŞEY" }
+
+    private fun cleanFetch(t: Tab, r: WebResourceRequest, depth: Int = 0): WebResourceResponse? {
+        val url = r.url.toString()
+        if (!url.startsWith("http") || r.method != "GET") return null
+        val rh = r.requestHeaders ?: return null
+        if (rh.keys.any { it.equals("Range", true) }) return null
+        val accept = rh.entries.firstOrNull { it.key.equals("Accept", true) }?.value ?: ""
+        val isDoc = r.isForMainFrame || accept.contains("text/html", true)
+        if (cleanMode < 2 && !isDoc && !accept.contains("json", true)) return null
+        if (cleanMode >= 2 && !isDoc) {
+            val low = url.lowercase()
+            if (accept.startsWith("video") || accept.startsWith("audio")) return null
+            if (Regex("\\.(mp4|m4s|m3u8|ts|mpd|webm|mkv|mp3|aac|m4a)(\\?|\$)").containsMatchIn(low)) return null
+        }
+        return try {
+            val c = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+            c.instanceFollowRedirects = false
+            c.connectTimeout = 15000
+            c.readTimeout = 30000
+            val skip = setOf("x-requested-with", "accept-encoding", "cookie", "host", "connection")
+            val sent = HashSet<String>()
+            for ((k, v) in rh) {
+                if (k.lowercase() in skip) continue
+                c.setRequestProperty(k, v)
+                sent.add(k.lowercase())
+            }
+            val ua = rh.entries.firstOrNull { it.key.equals("User-Agent", true) }?.value ?: t.web.settings.userAgentString
+            c.setRequestProperty("User-Agent", ua)
+            val mob = !t.desktop
+            fun put(k: String, v: String) { if (k.lowercase() !in sent) c.setRequestProperty(k, v) }
+            put("Accept-Language", "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7")
+            put("sec-ch-ua", "\"Chromium\";v=\"$chMajor\", \"Google Chrome\";v=\"$chMajor\", \"Not_A Brand\";v=\"24\"")
+            put("sec-ch-ua-mobile", if (mob) "?1" else "?0")
+            put("sec-ch-ua-platform", if (mob) "\"Android\"" else "\"Windows\"")
+            if (isDoc) {
+                put("Upgrade-Insecure-Requests", "1")
+                put("Sec-Fetch-Dest", if (r.isForMainFrame) "document" else "iframe")
+                put("Sec-Fetch-Mode", "navigate")
+                put("Sec-Fetch-Site", "none")
+                put("Sec-Fetch-User", "?1")
+            } else {
+                val low = url.substringBefore('?').lowercase()
+                val dest = when {
+                    accept.startsWith("text/css") || low.endsWith(".css") -> "style"
+                    accept.startsWith("image") || Regex("\\.(png|jpe?g|gif|webp|avif|svg|ico)\$").containsMatchIn(low) -> "image"
+                    low.endsWith(".js") || low.endsWith(".mjs") -> "script"
+                    low.matches(Regex(".*\\.(woff2?|ttf|otf)\$")) -> "font"
+                    else -> "empty"
+                }
+                val pageHost = try { java.net.URL(t.web.url ?: url).host } catch (e: Exception) { "" }
+                val site = if (pageHost == java.net.URL(url).host) "same-origin" else "cross-site"
+                put("Sec-Fetch-Dest", dest)
+                put("Sec-Fetch-Mode", if (dest == "empty" || dest == "font") "cors" else "no-cors")
+                put("Sec-Fetch-Site", site)
+            }
+            val cm = CookieManager.getInstance()
+            cm.getCookie(url)?.let { if (it.isNotEmpty()) c.setRequestProperty("Cookie", it) }
+
+            val code = c.responseCode
+            c.headerFields?.get("Set-Cookie")?.forEach { cm.setCookie(url, it) }
+            c.headerFields?.get("set-cookie")?.forEach { cm.setCookie(url, it) }
+            cm.flush()
+
+            if (code in 300..399) {
+                val loc = c.getHeaderField("Location")
+                c.disconnect()
+                if (loc == null) return null
+                val abs = java.net.URL(java.net.URL(url), loc).toString()
+                val esc = abs.replace("\\", "\\\\").replace("\"", "\\\"")
+                val body = "<!doctype html><meta charset=utf-8><script>location.replace(\"" + esc + "\")</script>"
+                return WebResourceResponse("text/html", "utf-8", 200, "OK", mapOf("Cache-Control" to "no-store"), body.byteInputStream())
+            }
+
+            val ctype = c.contentType ?: "text/html"
+            val mime = ctype.substringBefore(';').trim().ifEmpty { "text/html" }
+            val enc = Regex("charset=([^;\\s]+)", RegexOption.IGNORE_CASE).find(ctype)?.groupValues?.get(1)?.trim('"') ?: "utf-8"
+            val drop = setOf("content-encoding", "content-length", "transfer-encoding", "set-cookie", "connection", "keep-alive", "content-type", "content-security-policy-report-only")
+            val out = HashMap<String, String>()
+            c.headerFields?.forEach { (k, v) ->
+                if (k != null && k.lowercase() !in drop && v.isNotEmpty()) out[k] = v.joinToString(", ")
+            }
+            val stream = if (code >= 400) (c.errorStream ?: java.io.ByteArrayInputStream(ByteArray(0))) else c.inputStream
+            val reason = c.responseMessage?.takeIf { it.isNotBlank() } ?: "OK"
+            WebResourceResponse(mime, enc, code, reason, out, stream)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
     private fun stripRequestedWith(s: WebSettings) {
         try {
             if (WebViewFeature.isFeatureSupported(WebViewFeature.REQUESTED_WITH_HEADER_ALLOW_LIST)) {
@@ -547,7 +640,7 @@ class MainActivity : Activity() {
         override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
             val r = request ?: return null
             if (r.method == "GET") sniff(t, r)
-            return null
+            return if (cleanFetchOn) cleanFetch(t, r) else null
         }
 
         override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
@@ -1501,7 +1594,8 @@ class MainActivity : Activity() {
             "Ağ isteklerini göster (tanılama)",
             "İndirme bağlantı sayısı: ${Dm.connections}",
             "Sayfa izleyici (JS): " + (if (t.hook != null) "AÇIK" else "kapalı"),
-            "Kimlik raporu kaydet (İndirilenler)"
+            "Kimlik raporu kaydet (İndirilenler)",
+            "Chrome başlık modu: " + cleanName()
         )
         AlertDialog.Builder(this)
             .setItems(items) { _, i ->
@@ -1526,9 +1620,14 @@ class MainActivity : Activity() {
                     6 -> showNetLog()
                     7 -> chooseConns()
                     8 -> toggleHook(t)
-                    else -> {
+                    9 -> {
                         t.web.evaluateJavascript(Hook.REPORT_JS, null)
                         toast("Rapor hazırlanıyor…")
+                    }
+                    else -> {
+                        cleanMode = (cleanMode + 1) % 3
+                        toast("Chrome başlık modu: " + cleanName())
+                        t.web.reload()
                     }
                 }
             }
