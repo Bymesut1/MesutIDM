@@ -9,18 +9,18 @@ object Hook {
   var seen = {};
   var __q = [];
   function __call(n, a){
-    if (n === 'found') IDM.found(a[0], a[1], a[2]);
-    else if (n === 'sub') IDM.sub(a[0], a[1], a[2]);
-    else if (n === 'subData') IDM.subData(a[0], a[1], a[2], a[3], a[4]);
+    if (n === 'found') _nbr9x.found(a[0], a[1], a[2]);
+    else if (n === 'sub') _nbr9x.sub(a[0], a[1], a[2]);
+    else if (n === 'subData') _nbr9x.subData(a[0], a[1], a[2], a[3], a[4]);
   }
   // IDM köprüsü henüz hazır değilse kayıt kaybolmasın: kuyruğa al, hazır olunca gönder
   function send(n, a){
-    try { if (typeof IDM !== 'undefined') { __call(n, a); return; } } catch (e) {}
+    try { if (typeof _nbr9x !== 'undefined') { __call(n, a); return; } } catch (e) {}
     __q.push([n, a]);
     if (__q.length > 300) __q.shift();
   }
   setInterval(function(){
-    if (!__q.length || typeof IDM === 'undefined') return;
+    if (!__q.length || typeof _nbr9x === 'undefined') return;
     var q = __q; __q = [];
     for (var i = 0; i < q.length; i++) { try { __call(q[i][0], q[i][1]); } catch (e) {} }
   }, 600);
@@ -270,6 +270,94 @@ object Hook {
       Object.defineProperty(Navigator.prototype, 'userAgentData', { get: function(){ return shim; }, configurable: true });
     }
   } catch (e) {}
+
+  // ---- ek Chrome sertleştirmesi: WebView izlerini gizle ----
+  try {
+    if (navigator.webdriver) Object.defineProperty(Navigator.prototype, 'webdriver', { get: function(){ return false; }, configurable: true });
+  } catch (e) {}
+  try {
+    if (window.chrome) {
+      if (!window.chrome.runtime) window.chrome.runtime = {};
+      if (!window.chrome.loadTimes) window.chrome.loadTimes = function(){ return {}; };
+      if (!window.chrome.csi) window.chrome.csi = function(){ return {}; };
+    }
+  } catch (e) {}
+  try {
+    // köprü nesnesini kendi enumerate listesinden sakla (window anahtarlarında görünmesin)
+    var d = Object.getOwnPropertyDescriptor(window, '_nbr9x');
+    if (d && d.configurable) { d.enumerable = false; Object.defineProperty(window, '_nbr9x', d); }
+  } catch (e) {}
+
+  // ---- WebView'da bulunmayan, Chrome'da olan API'ler (siteler bunlara bakarak WebView'ı ayırt eder) ----
+  try {
+    if (typeof window.Notification === 'undefined') {
+      var N = function Notification(t, o){ this.title = t; };
+      N.permission = 'default';
+      N.maxActions = 2;
+      N.requestPermission = function(cb){ if (cb) try { cb('denied'); } catch (e) {} return Promise.resolve('denied'); };
+      N.prototype.close = function(){};
+      N.prototype.addEventListener = function(){};
+      window.Notification = N;
+    }
+  } catch (e) {}
+  try {
+    if (typeof window.PushManager === 'undefined') {
+      var PM = function PushManager(){};
+      PM.supportedContentEncodings = ['aes128gcm', 'aesgcm'];
+      PM.prototype.getSubscription = function(){ return Promise.resolve(null); };
+      PM.prototype.permissionState = function(){ return Promise.resolve('prompt'); };
+      PM.prototype.subscribe = function(){ return Promise.reject(new DOMException('Registration failed - permission denied', 'NotAllowedError')); };
+      window.PushManager = PM;
+    }
+  } catch (e) {}
+  try {
+    if (navigator.plugins && navigator.plugins.length === 0 && !/Mobile/.test(navigator.userAgent)) {
+      /* masaüstü Chrome'da PDF eklentileri listelenir; mobilde boş normaldir */
+    }
+    if (!navigator.languages || !navigator.languages.length) {
+      Object.defineProperty(Navigator.prototype, 'languages', { get: function(){ return ['tr-TR', 'tr', 'en-US', 'en']; }, configurable: true });
+    }
+  } catch (e) {}
+})();
+"""
+
+// Tanı raporu: kimlik izleri + sayfa HTML'i + sayfa scriptleri -> İndirilenler/kimlik-raporu-*.txt
+  const val REPORT_JS = """
+(async function(){
+  var o = [];
+  function p(k, v){ o.push(k + ': ' + v); }
+  try {
+    p('UA', navigator.userAgent); p('platform', navigator.platform); p('vendor', navigator.vendor);
+    p('webdriver', navigator.webdriver); p('languages', navigator.languages);
+    p('plugins', navigator.plugins.length);
+    p('Notification', typeof window.Notification); p('PushManager', typeof window.PushManager);
+    p('serviceWorker', 'serviceWorker' in navigator);
+    p('chrome keys', window.chrome ? Object.keys(window.chrome).join(',') : 'YOK');
+    try {
+      var ud = navigator.userAgentData;
+      p('uaData brands', JSON.stringify(ud && ud.brands));
+      var hv = await ud.getHighEntropyValues(['fullVersionList', 'model', 'platformVersion', 'uaFullVersion']);
+      p('uaData high', JSON.stringify(hv));
+    } catch (e) { p('uaData err', e); }
+    var f = document.createElement('iframe'); f.style.display = 'none'; document.documentElement.appendChild(f);
+    var clean = Object.getOwnPropertyNames(f.contentWindow);
+    var extra = Object.getOwnPropertyNames(window).filter(function(k){ return clean.indexOf(k) < 0; });
+    f.remove();
+    p('window ekstra ozellikler', extra.join(','));
+    p('display-mode standalone', matchMedia('(display-mode: standalone)').matches);
+    p('referrer', document.referrer);
+    p('href', location.href);
+  } catch (e) { p('hata', e); }
+  o.push('\n===== HTML =====\n' + document.documentElement.outerHTML.slice(0, 400000));
+  var ss = document.querySelectorAll('script[src]');
+  for (var i = 0; i < ss.length && i < 20; i++) {
+    try {
+      var r = await fetch(ss[i].src);
+      var t = await r.text();
+      o.push('\n===== SCRIPT ' + ss[i].src + ' =====\n' + t.slice(0, 300000));
+    } catch (e) { o.push('SCRIPT ALINAMADI ' + ss[i].src); }
+  }
+  _nbr9x.saveReport('kimlik-raporu-' + Date.now() + '.txt', o.join('\n'));
 })();
 """
 }
