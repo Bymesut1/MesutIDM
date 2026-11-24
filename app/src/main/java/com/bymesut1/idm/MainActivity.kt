@@ -483,10 +483,12 @@ class MainActivity : Activity() {
             c.instanceFollowRedirects = false
             c.connectTimeout = 15000
             c.readTimeout = 30000
-            val skip = setOf("x-requested-with", "accept-encoding", "cookie", "host", "connection")
+            val skip = setOf("accept-encoding", "cookie", "host", "connection")
             val sent = HashSet<String>()
             for ((k, v) in rh) {
                 if (k.lowercase() in skip) continue
+                // Sitenin kendi JS'inin eklediği "fetch"/"XMLHttpRequest" değerini koru, sadece uygulama paket adını at
+                if (k.equals("X-Requested-With", true) && (v == packageName || v.contains('.'))) continue
                 c.setRequestProperty(k, v)
                 sent.add(k.lowercase())
             }
