@@ -346,6 +346,14 @@ object Hook {
     p('window ekstra ozellikler', extra.join(','));
     p('display-mode standalone', matchMedia('(display-mode: standalone)').matches);
     p('referrer', document.referrer);
+    try {
+      var rs = performance.getEntriesByType('resource');
+      var bad = rs.filter(function(e){ return (e.responseStatus && e.responseStatus >= 400) || (e.transferSize === 0 && e.decodedBodySize === 0); });
+      p('kaynak sayisi', rs.length + ' / sorunlu: ' + bad.length);
+      bad.slice(0, 40).forEach(function(e){ p('  sorunlu', e.initiatorType + ' ' + (e.responseStatus || '?') + ' ' + e.name); });
+      var hosts = {}; rs.forEach(function(e){ try { hosts[new URL(e.name).host] = 1; } catch (x) {} });
+      p('kaynak hostlari', Object.keys(hosts).join(','));
+    } catch (e) { p('resource err', e); }
     p('href', location.href);
   } catch (e) { p('hata', e); }
   o.push('\n===== HTML =====\n' + document.documentElement.outerHTML.slice(0, 400000));
